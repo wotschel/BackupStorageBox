@@ -222,7 +222,8 @@ Both phases run in ascending filename order using the C locale. Use fixed-width
 numeric prefixes (`10-`, `20-`, `30-`) to make the sequence explicit; `10` sorts
 before `2`. Post order is also ascending, not reversed. Only executable,
 non-hidden files directly inside each directory run; subdirectories and
-non-executable files are skipped. Each script runs as a separate process with
+non-executable files are skipped with a warning and a `chmod +x` hint.
+These warnings also appear in notification mail when enabled. Each script runs as a separate process with
 its own shebang, as the user running `backup.sh`, and cannot change its shell
 variables or working directory. Use absolute paths inside your scripts.
 

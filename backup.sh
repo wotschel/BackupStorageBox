@@ -272,10 +272,15 @@ on_exit() {
 # Execute child processes rather than sourcing user code into this shell.
 # Each phase uses a stable C-locale filename order; use 10-, 20-, ... prefixes.
 run_actions() {
-    local phase="$1" status="${2:-0}" script rc failed=0
+    local phase="$1" status="${2:-0}" script rc enable_cmd failed=0
     [[ -n $WRAPPERS_DIR && -d $WRAPPERS_DIR/$phase ]] || return 0
     while IFS= read -r -d '' script; do
-        [[ -f $script && -x $script ]] || continue
+        [[ -f $script ]] || continue
+        if [[ ! -x $script ]]; then
+            printf -v enable_cmd 'chmod +x -- %q' "$script"
+            warn "Skipping $phase action: $script is not executable. Enable it with: $enable_cmd"
+            continue
+        fi
         log "Running $phase action: $script"
         if BACKUP_EXIT_CODE="$status" BACKUP_CONFIG="$CONFIG" BACKUP_NAME="$BACKUP_NAME" \
             "$script" 2>&1 | tee -a "$LOG_FILE"; then

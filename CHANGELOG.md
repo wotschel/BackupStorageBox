@@ -5,6 +5,10 @@ versioning according to [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- Warn when local pre/post action files lack execute permission, including
+  the file path and a `chmod +x` hint, instead of silently skipping them.
+
 ### Removed
 - `nextcloud-backup.sh` and its setup instructions. Application-specific
   preparation and cleanup belong in local `wrappers/pre/` and `wrappers/post/`

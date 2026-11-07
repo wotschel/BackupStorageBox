@@ -57,7 +57,8 @@ Requirements:
 - Execute local scripts directly from `wrappers/pre/` and `wrappers/post/`
   beside the resolved `backup.sh` (`WRAPPERS_DIR` configurable; empty disables).
   Use ascending C-locale filename order, separate processes, executable files
-  only. Pre failure skips backup; all post scripts run after preparation starts,
+  only; warn with a file path and `chmod +x` hint when a file is not
+  executable. Pre failure skips backup; all post scripts run after preparation starts,
   including on errors/signals. Preserve failure status, log output and mail
   action failures. Export BACKUP_CONFIG, BACKUP_NAME and BACKUP_EXIT_CODE.
   Lock the whole lifecycle and check source existence after pre actions.

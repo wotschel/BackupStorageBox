@@ -118,11 +118,26 @@ WRAPPERS_DIR='{self.base / 'wrappers'}'
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(source.is_dir())
 
-    def test_nonexecutable_actions_are_skipped(self):
-        script = self.action('pre', '10-disabled', 'exit 9')
-        script.chmod(0o600)
+    def test_nonexecutable_actions_warn_and_are_skipped(self):
+        for phase in ('pre', 'post'):
+            script = self.action(phase, '10-disabled script.sh', 'echo unexpected >> "$CALLS"; exit 9')
+            script.chmod(0o600)
         result = self.run_backup(self.base)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn('unexpected', self.calls.read_text())
+        for phase in ('pre', 'post'):
+            self.assertIn(f'Warning: Skipping {phase} action:', result.stdout)
+            self.assertIn(str(self.base / 'wrappers' / phase / '10-disabled script.sh'), result.stdout)
+        self.assertIn('is not executable. Enable it with: chmod +x -- ', result.stdout)
+
+    def test_placeholders_and_subdirectories_do_not_warn(self):
+        directory = self.base / 'wrappers' / 'pre'
+        directory.mkdir(parents=True)
+        (directory / '.gitkeep').touch()
+        (directory / 'subdirectory').mkdir()
+        result = self.run_backup(self.base)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn('Skipping pre action:', result.stdout)
 
     def test_signal_runs_post(self):
         self.action('pre', '10-signal', 'kill -TERM "$PPID"')
