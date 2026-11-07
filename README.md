@@ -120,6 +120,9 @@ for the Storage Box (see below).
 | `LOG_FILE`    | Log file                                          | `/var/log/backup.log` |
 | `HOOKS_DIR`   | Folder with `pre.d/` and `post.d/`, see "Hooks"   | `hooks` next to the configuration |
 | `HOOK_TIMEOUT` | Time limit per hook in seconds, `0` = none       | `3600`  |
+| `MAIL_TO`     | Mail recipients (comma-separated), see "Mail"     | empty = no mails |
+| `MAIL_FROM`   | Sender address                                    | empty = mail system default |
+| `MIN_FREE_PERCENT` | Warn below this free space on the target, `0` = off | `5` |
 | **rsync only** | | |
 | `RSYNC_OPTS`  | rsync options                                     | `-aHAX --numeric-ids --delete --delete-excluded` |
 | `SAVE_PERMS`  | Additionally save permissions via getfacl (1/0)   | `1`     |
@@ -181,6 +184,7 @@ owners and groups in the repository, so this does not apply there.
 
 ```
 backup.sh [-c FILE] [-n] [-v] [-h] [-V] [--init-config [FILE]]
+backup.sh [-c FILE] --test-mail
 backup.sh --restore-perms FILE [TARGET_ROOT] [-n]
 backup.sh [-c FILE] --restic RESTIC-ARGS...
 ```
@@ -191,6 +195,7 @@ backup.sh [-c FILE] --restic RESTIC-ARGS...
 | `-n` | dry run, nothing is changed |
 | `-v` / `--progress` | live progress display (terminal only, see below) |
 | `--init-config [FILE]` | write a sample configuration |
+| `--test-mail` | send a test mail to `MAIL_TO` |
 | `--restore-perms FILE [TARGET_ROOT]` | rsync method: restore permissions, see below |
 | `--restic ARGS...` | run restic with the configured repository, password and SSH settings |
 | `-h` / `-V` | help / version |
@@ -309,6 +314,48 @@ Without `pipefail` in `sh`, a failing `mysqldump` would not be noticed in
 the pipe; with Bash use `#!/bin/bash` and `set -eo pipefail` instead. The
 `.tmp` file and `mv` make sure a broken dump never replaces the last good
 one.
+
+## Mail notification
+
+With `MAIL_TO` set, the script sends a mail
+
+- **`[backup] FAILED: <name> (<date>)`** when the run ends with an error:
+  failed source, unreachable target, configuration error, failed hook,
+  interrupted run;
+- **`[backup] WARNING: <name> (<date>)`** when the backup succeeded but
+  there were warnings: less than `MIN_FREE_PERCENT` free space on the
+  target, unreadable files (restic code 3), old backups not removed.
+
+The mail contains the error, the warnings and the log of this run (last
+200 lines; empty if `LOG_FILE` is not writable). A dry run sends no mail,
+a successful run without warnings neither.
+
+```bash
+MAIL_TO="admin@example.org, ops@example.org"
+MAIL_FROM="backup@sv32.example.org"
+MIN_FREE_PERCENT=5
+```
+
+Mails are handed to `sendmail`, so the machine needs a mail transfer agent.
+For a server that does not receive mail, `msmtp-mta` (relay via an SMTP
+account) or `nullmailer` is enough; postfix works as well. The script does
+not install one, because it needs credentials. Test it with:
+
+```bash
+sudo backup.sh --test-mail
+```
+
+If sending fails, this is logged; the exit code of the backup stays the same.
+
+### Free space on the target
+
+Before the backup (and before the pre hooks) the script asks the target
+for its free space with `df` in sftp – no shell needed; the Storage Box
+reports its quota there. The log shows e.g.
+`Space on the target: 476.8 of 1024.0 GiB free (46.6%).` Below
+`MIN_FREE_PERCENT` this becomes a warning (and a mail); the backup still
+runs. If the server does not support `df` in sftp, only a note is logged.
+Storage Box snapshots count towards the quota as well.
 
 ## Running daily (systemd timer)
 

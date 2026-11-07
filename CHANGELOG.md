@@ -3,6 +3,29 @@
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 versioning according to [SemVer](https://semver.org/).
 
+## [3.5.0] – 2026-11-07
+
+### Added
+- Mail notification to `MAIL_TO` (comma-separated, optional `MAIL_FROM`)
+  via `sendmail` (e.g. msmtp-mta, nullmailer, postfix):
+  - `[backup] FAILED: <name>` when a run ends with an error – including
+    configuration errors, failed hooks and interrupted runs
+  - `[backup] WARNING: <name>` when a successful run had warnings
+  - the mail contains the error, the warnings and the log of this run
+    (last 200 lines); no mails in a dry run
+  - `--test-mail` sends a test mail
+- Free-space check before the backup: less than `MIN_FREE_PERCENT`
+  (default 5, `0` = off) free on the target is a warning. Uses `df` in
+  sftp, so no shell is needed on the target (the Storage Box reports its
+  quota there); if it cannot be determined, only a note is logged
+
+### Changed
+- These are now warnings (and trigger a mail): restic exit code 3 (some
+  files unreadable), failed removal of old snapshots/backups
+
+### Fixed
+- After post hooks had run, errexit was active again in the exit handler
+
 ## [3.4.1] – 2026-11-07
 
 ### Changed

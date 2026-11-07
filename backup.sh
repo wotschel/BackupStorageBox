@@ -15,9 +15,12 @@
 # database dumps, maintenance mode on), those in <HOOKS_DIR>/post.d afterwards
 # – always, even if the backup failed or was interrupted.
 #
+# Mail (MAIL_TO): on failure, on warnings, and when the target has less than
+# MIN_FREE_PERCENT free space before the backup.
+#
 set -euo pipefail
 
-readonly VERSION="3.4.1"
+readonly VERSION="3.5.0"
 # Kept outside the script directory, so the repository can be updated or
 # re-cloned at any time without touching the configuration.
 readonly DEFAULT_CONFIG="/etc/backup/backup.conf"
@@ -36,6 +39,10 @@ RESTIC_PASSTHRU_ARGS=()
 LOG_FILE="/dev/null"
 STAGE=""
 POST_HOOKS_PENDING=0
+TEST_MAIL=0
+LAST_ERROR=""
+WARNINGS=()
+LOG_START=0
 
 # --- Helpers -----------------------------------------------------------------
 
@@ -46,7 +53,10 @@ log() {
     echo "$line" >> "$LOG_FILE" 2>/dev/null || true
 }
 
-die() { log "ERROR: $*"; exit 1; }
+die() { LAST_ERROR="$*"; log "ERROR: $*"; exit 1; }
+
+# Logs a warning and collects it for the notification mail
+warn() { WARNINGS+=("$*"); log "Warning: $*"; }
 
 # Makes sure a command is available; otherwise installs its package.
 # Usage: ensure_cmd COMMAND PACKAGE
@@ -76,6 +86,7 @@ ensure_cmd() {
 usage() {
     cat <<EOF
 Usage: ${0##*/} [-c FILE] [-n] [-v] [-h] [-V] [--init-config [FILE]]
+       ${0##*/} [-c FILE] --test-mail
        ${0##*/} --restore-perms FILE [TARGET_ROOT] [-n]
        ${0##*/} [-c FILE] --restic RESTIC-ARGS...
 
@@ -85,6 +96,7 @@ Usage: ${0##*/} [-c FILE] [-n] [-v] [-h] [-V] [--init-config [FILE]]
   -v, --progress         show a live progress display (terminal only;
                          the log gets the final state, not every update)
   --init-config [FILE]   write a sample configuration and exit
+  --test-mail            send a test mail to MAIL_TO and exit
   --restore-perms FILE [TARGET_ROOT]
                          rsync method: restore owners, groups, permissions
                          and ACLs from a saved $PERMS_FILE
@@ -150,6 +162,15 @@ LOG_FILE="/var/log/backup.log"
 #HOOKS_DIR="/etc/backup/hooks"
 HOOK_TIMEOUT=3600               # seconds per hook, 0 = no limit
 
+# --- Notifications ---
+# Mail to MAIL_TO (comma-separated) when the backup fails or has warnings,
+# e.g. less than MIN_FREE_PERCENT free space on the target before the backup.
+# Needs a working "sendmail" (e.g. package msmtp-mta, nullmailer or postfix).
+# Test with: backup.sh --test-mail
+MAIL_TO=""                      # empty = no mails
+MAIL_FROM=""                    # empty = default of the mail system
+MIN_FREE_PERCENT=5              # 0 = do not check
+
 # =============================================================================
 # rsync only
 # =============================================================================
@@ -186,6 +207,200 @@ RESTIC_FORGET_OPTS=(--keep-daily 7 --keep-weekly 5 --keep-monthly 12)
 EOF
 }
 
+# =============================================================================
+# Free space and mail
+# =============================================================================
+
+# Warns if the target has less than MIN_FREE_PERCENT free space. Uses "df" in
+# sftp (statvfs@openssh.com extension), so no shell is needed on the target;
+# the Storage Box reports its quota there. Not determinable = note only.
+check_free_space() {
+    (( MIN_FREE_PERCENT > 0 )) || return 0
+    local out size="" avail=""
+    local -a sftp=(sftp -q -b - -P "$SSH_PORT" -o BatchMode=yes -o ConnectTimeout=15)
+    [[ -n $SSH_KEY ]] && sftp+=(-i "$SSH_KEY")
+
+    if ! out="$("${sftp[@]}" "$REMOTE" <<<"df" 2>&1)"; then
+        log "Note: could not determine the free space on the target: ${out##*$'\n'}"
+        return 0
+    fi
+    # Columns: Size Used Avail (root) %Capacity, in KiB
+    read -r size avail < <(awk '$1 ~ /^[0-9]+$/ && NF >= 5 {print $1, $3; exit}' <<<"$out") || true
+    if [[ ! $size =~ ^[0-9]+$ || ! $avail =~ ^[0-9]+$ ]] || (( size == 0 )); then
+        log "Note: could not determine the free space on the target (unexpected df output)."
+        return 0
+    fi
+
+    local info
+    info="$(LC_ALL=C awk -v a="$avail" -v s="$size" \
+        'BEGIN { printf "%.1f of %.1f GiB free (%.1f%%)", a/1048576, s/1048576, a*100/s }')"
+    if (( avail * 100 < size * MIN_FREE_PERCENT )); then
+        warn "Low space on the target: $info – less than ${MIN_FREE_PERCENT}%."
+    else
+        log "Space on the target: $info."
+    fi
+}
+
+# Sends a plain-text mail to MAIL_TO via sendmail; body from stdin.
+# Usage: send_mail SUBJECT
+send_mail() {
+    local subject="$1" sm
+    sm="$(command -v sendmail 2>/dev/null || true)"
+    [[ -z $sm && -x /usr/sbin/sendmail ]] && sm=/usr/sbin/sendmail
+    if [[ -z $sm ]]; then
+        log "Warning: cannot send mail – no sendmail found (install e.g. msmtp-mta or postfix)."
+        return 1
+    fi
+    local rc=0
+    {
+        printf 'To: %s\n' "$MAIL_TO"
+        [[ -n $MAIL_FROM ]] && printf 'From: %s\n' "$MAIL_FROM"
+        printf 'Subject: %s\n' "$subject"
+        printf 'MIME-Version: 1.0\nContent-Type: text/plain; charset=UTF-8\n'
+        printf 'Content-Transfer-Encoding: 8bit\n\n'
+        cat
+    } | "$sm" -t -oi || rc=$?
+    if (( rc != 0 )); then
+        log "Warning: sending the mail to $MAIL_TO failed (sendmail exit code $rc)."
+        return 1
+    fi
+    log "Mail sent to $MAIL_TO: $subject"
+}
+
+# Mail after a run that failed or had warnings (called from on_exit)
+notify() {
+    local rc="$1" status w
+    [[ -n $MAIL_TO ]] || return 0
+    (( DRY_RUN || RESTIC_PASSTHRU || TEST_MAIL )) && return 0
+    if (( rc != 0 )); then
+        status="FAILED"
+    elif (( ${#WARNINGS[@]} > 0 )); then
+        status="WARNING"
+    else
+        return 0
+    fi
+    {
+        echo "Backup $BACKUP_NAME on $(hostname -f 2>/dev/null || hostname): $status (exit code $rc)"
+        echo
+        echo "Configuration: $CONFIG"
+        echo "Method:        $BACKUP_METHOD"
+        echo "Target:        ${REMOTE_USER}@${REMOTE_HOST}"
+        echo "Duration:      ${SECONDS}s"
+        [[ -n $LAST_ERROR ]] && printf '\nError:\n  %s\n' "$LAST_ERROR"
+        if (( ${#WARNINGS[@]} > 0 )); then
+            printf '\nWarnings:\n'
+            for w in "${WARNINGS[@]}"; do printf '  - %s\n' "$w"; done
+        fi
+        if [[ $LOG_FILE != /dev/null && -r $LOG_FILE ]]; then
+            printf '\n--- Log of this run (last 200 lines, full log: %s) ---\n' "$LOG_FILE"
+            tail -c "+$((LOG_START + 1))" -- "$LOG_FILE" | tail -n 200
+        fi
+    } | send_mail "[backup] $status: $BACKUP_NAME ($(date +%F))"
+}
+
+# =============================================================================
+# Hooks
+# =============================================================================
+
+# Runs the executable files in <HOOKS_DIR>/<PHASE>.d in lexical order, output
+# goes to the log. Phase "pre" stops at the first failing hook, phase "post"
+# runs all of them. Returns 1 if a hook failed. A dry run only lists them.
+# Usage: run_hooks pre|post
+run_hooks() {
+    local phase="$1" dir="${HOOKS_DIR%/}/$1.d"
+    local hook name rc owner perms failed=0
+    local -a hooks=()
+    [[ -d $dir ]] || return 0
+
+    for hook in "$dir"/*; do               # hidden files are not matched
+        [[ -f $hook ]] || continue
+        name="${hook##*/}"
+        case $name in *~|*.bak|*.disabled|*.dpkg-*|*.swp) continue ;; esac
+        if [[ ! -x $hook ]]; then
+            log "Hook $phase.d/$name skipped (not executable)."
+            continue
+        fi
+        hooks+=("$hook")
+    done
+    (( ${#hooks[@]} > 0 )) || return 0
+
+    export BACKUP_PHASE="$phase" BACKUP_NAME BACKUP_METHOD
+    export BACKUP_CONFIG="$CONFIG" BACKUP_LOG_FILE="$LOG_FILE"
+
+    for hook in "${hooks[@]}"; do
+        name="$phase.d/${hook##*/}"
+        if (( DRY_RUN )); then
+            log "Dry run: would run hook $name"
+            continue
+        fi
+        # Hooks run as root: refuse files others could have changed
+        if (( EUID == 0 )); then
+            read -r owner perms < <(stat -c '%u %a' -- "$hook")
+            if (( owner != 0 || (8#$perms & 8#022) )); then
+                log "ERROR: hook $name is not owned by root or writable by group/others – not run."
+                failed=1
+                [[ $phase == pre ]] && break
+                continue
+            fi
+        fi
+        log "Running hook $name ..."
+        set +e
+        if (( HOOK_TIMEOUT > 0 )); then
+            timeout -k 30 "$HOOK_TIMEOUT" "$hook" </dev/null 2>&1 | tee -a "$LOG_FILE"
+        else
+            "$hook" </dev/null 2>&1 | tee -a "$LOG_FILE"
+        fi
+        rc=${PIPESTATUS[0]}
+        set -e
+        case $rc in
+            0)       log "Hook $name done." ;;
+            124|137) log "ERROR: hook $name timed out after ${HOOK_TIMEOUT}s."; failed=1 ;;
+            *)       log "ERROR: hook $name failed (exit code $rc)."; failed=1 ;;
+        esac
+        (( failed )) && [[ $phase == pre ]] && break
+    done
+    return "$failed"
+}
+
+# Creates <HOOKS_DIR>/pre.d and post.d if missing (not in a dry run). Failing
+# to create them is no error – without folders there are simply no hooks.
+ensure_hook_dirs() {
+    local d missing=()
+    (( DRY_RUN )) && return 0
+    for d in "${HOOKS_DIR%/}/pre.d" "${HOOKS_DIR%/}/post.d"; do
+        [[ -d $d ]] || missing+=("$d")
+    done
+    (( ${#missing[@]} > 0 )) || return 0
+    if mkdir -p -m 755 -- "${missing[@]}" 2>/dev/null; then
+        log "Created hook folders: ${missing[*]}"
+    else
+        log "Note: could not create hook folders under $HOOKS_DIR – running without hooks."
+    fi
+}
+
+# EXIT trap: runs the post hooks (if the pre phase was reached), sends the
+# notification mail and cleans up. A failing post hook turns a successful run
+# into exit code 1.
+on_exit() {
+    local rc=$?
+    trap - EXIT
+    set +e
+    if (( POST_HOOKS_PENDING )); then
+        POST_HOOKS_PENDING=0
+        export BACKUP_EXIT_CODE="$rc" BACKUP_RESULT="success"
+        (( rc == 0 )) || BACKUP_RESULT="failure"
+        if ! run_hooks post; then
+            LAST_ERROR="${LAST_ERROR:+$LAST_ERROR; }A post-backup hook failed – check the services it should have restored!"
+            log "ERROR: a post-backup hook failed – check the services it should have restored!"
+            (( rc == 0 )) && rc=1
+        fi
+        set +e   # run_hooks switches errexit back on
+    fi
+    notify "$rc"
+    [[ -n $STAGE ]] && rm -rf "$STAGE"
+    exit "$rc"
+}
+
 # --- Arguments ---------------------------------------------------------------
 
 while (( $# )); do
@@ -193,6 +408,7 @@ while (( $# )); do
         -c) CONFIG="${2:?-c requires a file name}"; shift 2 ;;
         -n) DRY_RUN=1; shift ;;
         -v|--progress) PROGRESS=1; shift ;;
+        --test-mail) TEST_MAIL=1; shift ;;
         --init-config)
             INIT_CONFIG=1
             if [[ -n ${2:-} && $2 != -* ]]; then INIT_TARGET="$2"; shift; fi
@@ -280,6 +496,7 @@ RESTIC_PASSWORD_FILE="/etc/backup/restic.pass"
 RESTIC_FORGET_OPTS=(--keep-daily 7 --keep-weekly 5 --keep-monthly 12)
 HOOKS_DIR="$(dirname -- "$CONFIG")/hooks"
 HOOK_TIMEOUT=3600
+MAIL_TO=""; MAIL_FROM=""; MIN_FREE_PERCENT=5
 
 # shellcheck source=/dev/null
 source "$CONFIG"
@@ -288,6 +505,15 @@ if ! touch "$LOG_FILE" 2>/dev/null; then
     (( RESTIC_PASSTHRU )) || echo "Warning: log file $LOG_FILE is not writable, logging to the console only." >&2
     LOG_FILE="/dev/null"
 fi
+# Start of this run in the log, for the excerpt in the notification mail
+LOG_START=$(stat -c %s -- "$LOG_FILE" 2>/dev/null || echo 0)
+
+# From here on errors are reported by mail; the post hooks run once the pre
+# phase has been reached. The signal traps exit, which triggers the EXIT trap.
+trap on_exit EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 [[ $BACKUP_METHOD == rsync || $BACKUP_METHOD == restic ]] \
                                || die "BACKUP_METHOD must be \"rsync\" or \"restic\" (is \"$BACKUP_METHOD\")"
@@ -297,6 +523,8 @@ fi
 (( ${#SOURCES[@]} > 0 ))       || die "SOURCES is empty"
 [[ $KEEP_DAYS =~ ^[0-9]+$ ]]   || die "KEEP_DAYS must be an integer"
 [[ $HOOK_TIMEOUT =~ ^[0-9]+$ ]] || die "HOOK_TIMEOUT must be an integer"
+[[ $MIN_FREE_PERCENT =~ ^[0-9]+$ ]] && (( MIN_FREE_PERCENT <= 100 )) \
+                               || die "MIN_FREE_PERCENT must be an integer from 0 to 100"
 for src in "${SOURCES[@]}"; do
     [[ $src == /* ]] || die "Source must be an absolute path: $src"
     [[ -e $src ]]    || die "Source does not exist: $src"
@@ -385,7 +613,8 @@ backup_restic() {
         set -e
         case $rc in
             0) log "[$n/${#SOURCES[@]}] $src done." ;;
-            3) log "[$n/${#SOURCES[@]}] $src done – WARNING: some files could not be read (restic 3)." ;;
+            3) log "[$n/${#SOURCES[@]}] $src done."
+               warn "$src: some files could not be read (restic exit code 3)." ;;
             *) log "[$n/${#SOURCES[@]}] ERROR for $src (restic exit code $rc)."
                failed+=("$src") ;;
         esac
@@ -409,7 +638,7 @@ backup_restic() {
         restic "${RESTIC_ARGS[@]}" "${fargs[@]}" 2>&1 | tee -a "$LOG_FILE"
         rc=${PIPESTATUS[0]}
         set -e
-        (( rc == 0 )) || log "Warning: removing old snapshots failed (restic exit code $rc)."
+        (( rc == 0 )) || warn "Removing old snapshots failed (restic exit code $rc)."
     fi
 
     if (( DRY_RUN )); then
@@ -544,7 +773,7 @@ backup_rsync() {
                 filter+=("--include=/${d}/***")
             done
             rs -r --delete "${filter[@]}" --exclude='*' "$STAGE/empty/" "${REMOTE}:${DEST_ROOT}/" \
-                || log "Warning: old backups could not be removed completely."
+                || warn "Old backups could not be removed completely."
         fi
     fi
 
@@ -554,111 +783,20 @@ backup_rsync() {
 # rsync without data transfer, only for housekeeping steps
 rs() { rsync -e "$RSH" "$@"; }
 
-# =============================================================================
-# Hooks
-# =============================================================================
-
-# Runs the executable files in <HOOKS_DIR>/<PHASE>.d in lexical order, output
-# goes to the log. Phase "pre" stops at the first failing hook, phase "post"
-# runs all of them. Returns 1 if a hook failed. A dry run only lists them.
-# Usage: run_hooks pre|post
-run_hooks() {
-    local phase="$1" dir="${HOOKS_DIR%/}/$1.d"
-    local hook name rc owner perms failed=0
-    local -a hooks=()
-    [[ -d $dir ]] || return 0
-
-    for hook in "$dir"/*; do               # hidden files are not matched
-        [[ -f $hook ]] || continue
-        name="${hook##*/}"
-        case $name in *~|*.bak|*.disabled|*.dpkg-*|*.swp) continue ;; esac
-        if [[ ! -x $hook ]]; then
-            log "Hook $phase.d/$name skipped (not executable)."
-            continue
-        fi
-        hooks+=("$hook")
-    done
-    (( ${#hooks[@]} > 0 )) || return 0
-
-    export BACKUP_PHASE="$phase" BACKUP_NAME BACKUP_METHOD
-    export BACKUP_CONFIG="$CONFIG" BACKUP_LOG_FILE="$LOG_FILE"
-
-    for hook in "${hooks[@]}"; do
-        name="$phase.d/${hook##*/}"
-        if (( DRY_RUN )); then
-            log "Dry run: would run hook $name"
-            continue
-        fi
-        # Hooks run as root: refuse files others could have changed
-        if (( EUID == 0 )); then
-            read -r owner perms < <(stat -c '%u %a' -- "$hook")
-            if (( owner != 0 || (8#$perms & 8#022) )); then
-                log "ERROR: hook $name is not owned by root or writable by group/others – not run."
-                failed=1
-                [[ $phase == pre ]] && break
-                continue
-            fi
-        fi
-        log "Running hook $name ..."
-        set +e
-        if (( HOOK_TIMEOUT > 0 )); then
-            timeout -k 30 "$HOOK_TIMEOUT" "$hook" </dev/null 2>&1 | tee -a "$LOG_FILE"
-        else
-            "$hook" </dev/null 2>&1 | tee -a "$LOG_FILE"
-        fi
-        rc=${PIPESTATUS[0]}
-        set -e
-        case $rc in
-            0)       log "Hook $name done." ;;
-            124|137) log "ERROR: hook $name timed out after ${HOOK_TIMEOUT}s."; failed=1 ;;
-            *)       log "ERROR: hook $name failed (exit code $rc)."; failed=1 ;;
-        esac
-        (( failed )) && [[ $phase == pre ]] && break
-    done
-    return "$failed"
-}
-
-# Creates <HOOKS_DIR>/pre.d and post.d if missing (not in a dry run). Failing
-# to create them is no error – without folders there are simply no hooks.
-ensure_hook_dirs() {
-    local d missing=()
-    (( DRY_RUN )) && return 0
-    for d in "${HOOKS_DIR%/}/pre.d" "${HOOKS_DIR%/}/post.d"; do
-        [[ -d $d ]] || missing+=("$d")
-    done
-    (( ${#missing[@]} > 0 )) || return 0
-    if mkdir -p -m 755 -- "${missing[@]}" 2>/dev/null; then
-        log "Created hook folders: ${missing[*]}"
-    else
-        log "Note: could not create hook folders under $HOOKS_DIR – running without hooks."
-    fi
-}
-
-# EXIT trap: runs the post hooks (if the pre phase was reached) and cleans up.
-# A failing post hook turns a successful run into exit code 1.
-on_exit() {
-    local rc=$?
-    trap - EXIT
-    set +e
-    if (( POST_HOOKS_PENDING )); then
-        POST_HOOKS_PENDING=0
-        export BACKUP_EXIT_CODE="$rc" BACKUP_RESULT="success"
-        (( rc == 0 )) || BACKUP_RESULT="failure"
-        if ! run_hooks post; then
-            log "ERROR: a post-backup hook failed – check the services it should have restored!"
-            (( rc == 0 )) && rc=1
-        fi
-    fi
-    [[ -n $STAGE ]] && rm -rf "$STAGE"
-    exit "$rc"
-}
-
 # --- Main --------------------------------------------------------------------
 
 # Pass-through to restic (snapshots, restore, mount, check, ...)
 if (( RESTIC_PASSTHRU )); then
     restic_setup
+    trap - EXIT HUP INT TERM
     exec restic "${RESTIC_ARGS[@]}" "${RESTIC_PASSTHRU_ARGS[@]}"
+fi
+
+if (( TEST_MAIL )); then
+    [[ -n $MAIL_TO ]] || die "MAIL_TO is empty in $CONFIG"
+    echo "Test mail from backup.sh $VERSION ($CONFIG) on $(hostname -f 2>/dev/null || hostname)." \
+        | send_mail "[backup] Test: $BACKUP_NAME" || exit 1
+    exit 0
 fi
 
 [[ $BACKUP_METHOD == restic ]] && restic_setup
@@ -676,12 +814,9 @@ exec 3>&1   # console, used by the progress display
 exec 9<"$CONFIG"
 flock -n 9 || die "A backup with $CONFIG is already running."
 
+check_free_space
+
 # From here on the post hooks always run, also on errors and signals
-# (the signal traps exit, which triggers the EXIT trap).
-trap on_exit EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
 POST_HOOKS_PENDING=1
 ensure_hook_dirs
 run_hooks pre || die "A pre-backup hook failed – backup aborted (post-backup hooks still run)."

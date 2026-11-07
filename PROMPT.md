@@ -69,6 +69,13 @@ Requirements:
   run fail. Per-hook timeout `HOOK_TIMEOUT` (default 3600 s); as root, refuse
   hooks not owned by root or writable by group/others; skip non-executable
   files with a note; in a dry run only list the hooks.
+- Mail notification via `sendmail` to `MAIL_TO` (optional `MAIL_FROM`):
+  `FAILED` on any error exit (also configuration errors, hooks, signals),
+  `WARNING` if a successful run collected warnings; body with error,
+  warnings and the log of this run (last 200 lines); none in a dry run;
+  `--test-mail` sends a test mail. Before the backup, check the free space
+  on the target with `df` in sftp (no shell needed) and warn below
+  `MIN_FREE_PERCENT` (default 5, 0 = off); if `df` fails, only log a note.
 - All output, comments and documentation in English.
 
 Also provide README.md (how it works, setup, configuration, systemd timer,
