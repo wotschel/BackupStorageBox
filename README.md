@@ -118,6 +118,8 @@ for the Storage Box (see below).
 | `EXCLUDES`    | Array of exclude patterns                         | empty   |
 | `KEEP_DAYS`   | rsync retention in days, `0` = never delete       | `30`    |
 | `LOG_FILE`    | Log file                                          | `/var/log/backup.log` |
+| `HOOKS_DIR`   | Folder with `pre.d/` and `post.d/`, see "Hooks"   | `hooks` next to the configuration |
+| `HOOK_TIMEOUT` | Time limit per hook in seconds, `0` = none       | `3600`  |
 | **rsync only** | | |
 | `RSYNC_OPTS`  | rsync options                                     | `-aHAX --numeric-ids --delete --delete-excluded` |
 | `SAVE_PERMS`  | Additionally save permissions via getfacl (1/0)   | `1`     |
@@ -227,6 +229,85 @@ sudo backup.sh -v
 
 Without a terminal (systemd, cron, output redirected) `-v` is ignored with a
 note, so the journal stays clean.
+
+## Hooks
+
+Hooks run commands before and after the backup, e.g. dump databases or put
+an application into maintenance mode. They are executable files in two
+folders next to the configuration (`--init-config` creates them):
+
+```
+/etc/backup/hooks/
+├── pre.d/      before the backup
+│   ├── 10-nextcloud-maintenance-on
+│   └── 20-mysqldump
+└── post.d/     after the backup – always
+    └── 90-nextcloud-maintenance-off
+```
+
+- Files run in lexical order, so prefix them with numbers. Their output
+  goes to the log.
+- **pre.d:** if a hook fails (exit code ≠ 0 or timeout), the remaining pre
+  hooks are skipped and the backup is aborted.
+- **post.d:** they run **always** once the pre phase has started – after a
+  successful backup, after an error, a failed pre hook and also when the
+  run is interrupted (`Ctrl+C`, `systemctl stop`). So everything a pre hook
+  switches on, a post hook can reliably switch off again. A failing post
+  hook makes the whole run exit with code 1.
+- Environment: `BACKUP_PHASE` (`pre`/`post`), `BACKUP_NAME`,
+  `BACKUP_METHOD`, `BACKUP_CONFIG`, `BACKUP_LOG_FILE`; post hooks
+  additionally get `BACKUP_RESULT` (`success`/`failure`) and
+  `BACKUP_EXIT_CODE`.
+- Each hook may run at most `HOOK_TIMEOUT` seconds (default 3600).
+- When the script runs as root, a hook must be owned by root and must not
+  be writable by group or others; otherwise it is refused (and counts as
+  failed).
+- Non-executable files are skipped with a note, so `chmod -x` disables a
+  hook. Hidden files and `*~`, `*.bak`, `*.disabled`, `*.dpkg-*` are
+  ignored.
+- A dry run (`-n`) only lists the hooks, it does not run them.
+- Hooks get no input (`stdin` is `/dev/null`).
+- Signals: a hook that is currently running is finished first, then the
+  post hooks run. Under systemd the running hook receives the `SIGTERM`
+  itself.
+
+### Example: Nextcloud with MariaDB/MySQL
+
+`pre.d/10-nextcloud-maintenance-on`
+```bash
+#!/bin/sh
+set -e
+sudo -u www-data php /var/www/nextcloud/occ maintenance:mode --on
+```
+
+`pre.d/20-mysqldump` – the dump folder must be in `SOURCES`
+```bash
+#!/bin/sh
+set -e
+umask 077
+mkdir -p /var/backups/mysql
+# Credentials from /root/.my.cnf (or socket authentication as root)
+mysqldump --all-databases --single-transaction --routines --events \
+    | gzip > /var/backups/mysql/all-databases.sql.gz.tmp
+mv /var/backups/mysql/all-databases.sql.gz.tmp /var/backups/mysql/all-databases.sql.gz
+```
+
+`post.d/90-nextcloud-maintenance-off`
+```bash
+#!/bin/sh
+sudo -u www-data php /var/www/nextcloud/occ maintenance:mode --off
+```
+
+```bash
+sudo chmod 755 /etc/backup/hooks/*/*
+sudo chown root:root /etc/backup/hooks/*/*
+# and in backup.conf: SOURCES+=("/var/backups/mysql")
+```
+
+Without `pipefail` in `sh`, a failing `mysqldump` would not be noticed in
+the pipe; with Bash use `#!/bin/bash` and `set -eo pipefail` instead. The
+`.tmp` file and `mv` make sure a broken dump never replaces the last good
+one.
 
 ## Running daily (systemd timer)
 
@@ -339,4 +420,5 @@ restic itself (as root).
   method or an encrypted file system.
 - Switching `BACKUP_METHOD` does not migrate or delete existing backups; both
   can coexist on the same box (`sv32/` and `restic-sv32/`).
-- Dump databases beforehand and back up the dump, not the live files.
+- Dump databases beforehand and back up the dump, not the live files – a
+  pre hook does that automatically, see "Hooks".

@@ -3,6 +3,34 @@
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 versioning according to [SemVer](https://semver.org/).
 
+## [3.4.0] – 2026-11-07
+
+### Added
+- Pre and post hooks: executable files in `<HOOKS_DIR>/pre.d/` run before
+  the backup, those in `<HOOKS_DIR>/post.d/` afterwards, each in lexical
+  order with their output in the log (e.g. database dumps, Nextcloud
+  maintenance mode)
+  - `HOOKS_DIR` defaults to the `hooks` folder next to the configuration
+    (`/etc/backup/hooks`); `--init-config` creates `pre.d/` and `post.d/`
+  - a failing pre hook aborts the backup; post hooks always run once the pre
+    phase has started, also after errors, `SIGINT`, `SIGTERM` and `SIGHUP`,
+    and get `BACKUP_RESULT=success|failure` and `BACKUP_EXIT_CODE`
+  - a failing post hook makes the run exit with code 1
+  - `HOOK_TIMEOUT` (default 3600 s, `0` = no limit) per hook
+  - as root, hooks not owned by root or writable by group/others are refused
+  - non-executable files are skipped with a note (`chmod -x` disables a
+    hook), as are hidden files and `*~`, `*.bak`, `*.disabled`, `*.dpkg-*`
+  - a dry run only lists the hooks it would run
+
+## [3.3.1] – 2026-11-07
+
+### Fixed
+- `Permission denied` on `/tmp/backup-<name>.lock` when the lock file had been
+  created by another user (Ubuntu's `fs.protected_regular` blocks even root).
+  The lock is now held on the configuration file itself (opened read-only),
+  so no lock file is created anymore; stale `/tmp/backup-*.lock` files can be
+  deleted
+
 ## [3.3.0] – 2026-11-07
 
 ### Added

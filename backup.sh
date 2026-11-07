@@ -11,9 +11,13 @@
 #   Encrypted, deduplicated snapshots in a restic repository reached via SFTP
 #   (default <REMOTE_BASE>/restic-<BACKUP_NAME>).
 #
+# Hooks: executable files in <HOOKS_DIR>/pre.d run before the backup (e.g.
+# database dumps, maintenance mode on), those in <HOOKS_DIR>/post.d afterwards
+# – always, even if the backup failed or was interrupted.
+#
 set -euo pipefail
 
-readonly VERSION="3.3.0"
+readonly VERSION="3.4.0"
 # Kept outside the script directory, so the repository can be updated or
 # re-cloned at any time without touching the configuration.
 readonly DEFAULT_CONFIG="/etc/backup/backup.conf"
@@ -30,6 +34,8 @@ RESTORE_ROOT="/"
 RESTIC_PASSTHRU=0
 RESTIC_PASSTHRU_ARGS=()
 LOG_FILE="/dev/null"
+STAGE=""
+POST_HOOKS_PENDING=0
 
 # --- Helpers -----------------------------------------------------------------
 
@@ -134,6 +140,16 @@ KEEP_DAYS=30
 # --- Log file ---
 LOG_FILE="/var/log/backup.log"
 
+# --- Hooks ---
+# Executable files in <HOOKS_DIR>/pre.d run before the backup, those in
+# <HOOKS_DIR>/post.d afterwards, each in lexical order (10-..., 20-...).
+# A failing pre hook aborts the backup; post hooks ALWAYS run once the pre
+# phase has started (also after errors or Ctrl+C), e.g. to end a maintenance
+# mode. They get BACKUP_RESULT=success|failure and BACKUP_EXIT_CODE.
+# Default: the "hooks" folder next to this configuration file.
+#HOOKS_DIR="/etc/backup/hooks"
+HOOK_TIMEOUT=3600               # seconds per hook, 0 = no limit
+
 # =============================================================================
 # rsync only
 # =============================================================================
@@ -211,6 +227,9 @@ if (( INIT_CONFIG )); then
     config_template > "$target"
     chmod 600 "$target"
     echo "Sample configuration written: $target"
+    if mkdir -p "$dir/hooks/pre.d" "$dir/hooks/post.d" 2>/dev/null; then
+        echo "Hook folders: $dir/hooks/pre.d and $dir/hooks/post.d"
+    fi
     echo "Note: mode 600 – view/edit with sudo, e.g. sudo nano $target"
     exit 0
 fi
@@ -259,6 +278,8 @@ RSYNC_OPTS=(-aHAX --numeric-ids --delete --delete-excluded)
 RESTIC_REPO_PATH=""
 RESTIC_PASSWORD_FILE="/etc/backup/restic.pass"
 RESTIC_FORGET_OPTS=(--keep-daily 7 --keep-weekly 5 --keep-monthly 12)
+HOOKS_DIR="$(dirname -- "$CONFIG")/hooks"
+HOOK_TIMEOUT=3600
 
 # shellcheck source=/dev/null
 source "$CONFIG"
@@ -275,6 +296,7 @@ fi
 [[ -n $BACKUP_NAME ]]          || die "BACKUP_NAME is missing in $CONFIG"
 (( ${#SOURCES[@]} > 0 ))       || die "SOURCES is empty"
 [[ $KEEP_DAYS =~ ^[0-9]+$ ]]   || die "KEEP_DAYS must be an integer"
+[[ $HOOK_TIMEOUT =~ ^[0-9]+$ ]] || die "HOOK_TIMEOUT must be an integer"
 for src in "${SOURCES[@]}"; do
     [[ $src == /* ]] || die "Source must be an absolute path: $src"
     [[ -e $src ]]    || die "Source does not exist: $src"
@@ -410,8 +432,7 @@ backup_rsync() {
     DEST="${DEST_ROOT}/${TODAY}"
     local DATE_PAT='[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
 
-    STAGE="$(mktemp -d)"
-    trap 'rm -rf "$STAGE"' EXIT
+    STAGE="$(mktemp -d)"   # removed by on_exit
     mkdir -p "$STAGE/empty"
 
     log "=== Backup $BACKUP_NAME -> $REMOTE:$DEST (rsync, v$VERSION) ==="
@@ -533,6 +554,89 @@ backup_rsync() {
 # rsync without data transfer, only for housekeeping steps
 rs() { rsync -e "$RSH" "$@"; }
 
+# =============================================================================
+# Hooks
+# =============================================================================
+
+# Runs the executable files in <HOOKS_DIR>/<PHASE>.d in lexical order, output
+# goes to the log. Phase "pre" stops at the first failing hook, phase "post"
+# runs all of them. Returns 1 if a hook failed. A dry run only lists them.
+# Usage: run_hooks pre|post
+run_hooks() {
+    local phase="$1" dir="${HOOKS_DIR%/}/$1.d"
+    local hook name rc owner perms failed=0
+    local -a hooks=()
+    [[ -d $dir ]] || return 0
+
+    for hook in "$dir"/*; do               # hidden files are not matched
+        [[ -f $hook ]] || continue
+        name="${hook##*/}"
+        case $name in *~|*.bak|*.disabled|*.dpkg-*|*.swp) continue ;; esac
+        if [[ ! -x $hook ]]; then
+            log "Hook $phase.d/$name skipped (not executable)."
+            continue
+        fi
+        hooks+=("$hook")
+    done
+    (( ${#hooks[@]} > 0 )) || return 0
+
+    export BACKUP_PHASE="$phase" BACKUP_NAME BACKUP_METHOD
+    export BACKUP_CONFIG="$CONFIG" BACKUP_LOG_FILE="$LOG_FILE"
+
+    for hook in "${hooks[@]}"; do
+        name="$phase.d/${hook##*/}"
+        if (( DRY_RUN )); then
+            log "Dry run: would run hook $name"
+            continue
+        fi
+        # Hooks run as root: refuse files others could have changed
+        if (( EUID == 0 )); then
+            read -r owner perms < <(stat -c '%u %a' -- "$hook")
+            if (( owner != 0 || (8#$perms & 8#022) )); then
+                log "ERROR: hook $name is not owned by root or writable by group/others – not run."
+                failed=1
+                [[ $phase == pre ]] && break
+                continue
+            fi
+        fi
+        log "Running hook $name ..."
+        set +e
+        if (( HOOK_TIMEOUT > 0 )); then
+            timeout -k 30 "$HOOK_TIMEOUT" "$hook" </dev/null 2>&1 | tee -a "$LOG_FILE"
+        else
+            "$hook" </dev/null 2>&1 | tee -a "$LOG_FILE"
+        fi
+        rc=${PIPESTATUS[0]}
+        set -e
+        case $rc in
+            0)       log "Hook $name done." ;;
+            124|137) log "ERROR: hook $name timed out after ${HOOK_TIMEOUT}s."; failed=1 ;;
+            *)       log "ERROR: hook $name failed (exit code $rc)."; failed=1 ;;
+        esac
+        (( failed )) && [[ $phase == pre ]] && break
+    done
+    return "$failed"
+}
+
+# EXIT trap: runs the post hooks (if the pre phase was reached) and cleans up.
+# A failing post hook turns a successful run into exit code 1.
+on_exit() {
+    local rc=$?
+    trap - EXIT
+    set +e
+    if (( POST_HOOKS_PENDING )); then
+        POST_HOOKS_PENDING=0
+        export BACKUP_EXIT_CODE="$rc" BACKUP_RESULT="success"
+        (( rc == 0 )) || BACKUP_RESULT="failure"
+        if ! run_hooks post; then
+            log "ERROR: a post-backup hook failed – check the services it should have restored!"
+            (( rc == 0 )) && rc=1
+        fi
+    fi
+    [[ -n $STAGE ]] && rm -rf "$STAGE"
+    exit "$rc"
+}
+
 # --- Main --------------------------------------------------------------------
 
 # Pass-through to restic (snapshots, restore, mount, check, ...)
@@ -550,9 +654,20 @@ if (( PROGRESS )) && [[ ! -t 1 ]]; then
 fi
 exec 3>&1   # console, used by the progress display
 
-# Only one instance at a time
-exec 9>"/tmp/backup-${BACKUP_NAME}.lock"
-flock -n 9 || die "A backup for $BACKUP_NAME is already running."
+# Only one instance per configuration at a time. The lock is held on the
+# configuration file itself (opened read-only), so no lock file is needed –
+# a lock file in /tmp breaks when another user created it (fs.protected_regular).
+exec 9<"$CONFIG"
+flock -n 9 || die "A backup with $CONFIG is already running."
+
+# From here on the post hooks always run, also on errors and signals
+# (the signal traps exit, which triggers the EXIT trap).
+trap on_exit EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+POST_HOOKS_PENDING=1
+run_hooks pre || die "A pre-backup hook failed – backup aborted (post-backup hooks still run)."
 
 case $BACKUP_METHOD in
     rsync)  backup_rsync ;;

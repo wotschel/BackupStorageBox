@@ -59,6 +59,16 @@ Requirements:
   --no-inc-recursive`, only the final state of the progress line goes to the
   log; restic writes stdout directly to the terminal so it draws its own
   progress bar, errors are still logged.
+- Pre and post hooks: run the executable files in `<HOOKS_DIR>/pre.d/`
+  before and in `<HOOKS_DIR>/post.d/` after the backup, in lexical order,
+  output to the log (`HOOKS_DIR` default: `hooks` next to the configuration
+  file; `--init-config` creates both folders). A failing pre hook aborts
+  the backup; post hooks always run once the pre phase has started, also on
+  errors and signals (EXIT trap), with `BACKUP_RESULT` and
+  `BACKUP_EXIT_CODE` in the environment, and a failing post hook makes the
+  run fail. Per-hook timeout `HOOK_TIMEOUT` (default 3600 s); as root, refuse
+  hooks not owned by root or writable by group/others; skip non-executable
+  files with a note; in a dry run only list the hooks.
 - All output, comments and documentation in English.
 
 Also provide README.md (how it works, setup, configuration, systemd timer,
