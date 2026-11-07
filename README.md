@@ -58,8 +58,13 @@ Replace `YOUR_STORAGEBOX_USER` below with your Storage Box username.
 
 ```bash
 # 1. Create an SSH key for the backup and deploy it to the Storage Box
-sudo ssh-keygen -t ed25519 -f /root/.ssh/backup_ed25519 -N ""
-sudo ssh-copy-id -p 23 -s -i /root/.ssh/backup_ed25519 YOUR_STORAGEBOX_USER@YOUR_STORAGEBOX_USER.your-storagebox.de
+sudo ssh-keygen -t ed25519 -N "" -C "backup@$(hostname)" -f /root/.ssh/backup_$(hostname)_ed25519
+
+sudo ssh -p 23 username@servername.your-storagebox.de
+
+sudo cat /root/.ssh/backup_$(hostname)_ed25519.pub \
+  | sudo ssh -p 23 username@servername.your-storagebox.de install-ssh-key
+
 
 # 2. Clone the repository and link the script
 sudo git clone https://github.com/wotschel/BackupStorageBox.git /opt/backup
