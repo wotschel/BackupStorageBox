@@ -14,7 +14,14 @@
 #
 set -euo pipefail
 
-readonly VERSION="5.0.0"
+# cron starts jobs with PATH=/usr/bin:/bin – add the sbin directories so that
+# runuser, sendmail etc. are found there too
+for d in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
+    [[ ":$PATH:" == *":$d:"* ]] || PATH="$PATH:$d"
+done
+export PATH
+
+readonly VERSION="5.0.2"
 # Kept outside the script directory, so the repository can be updated or
 # re-cloned at any time without touching the configuration.
 readonly DEFAULT_CONFIG="/etc/backup/backup.conf"
@@ -346,13 +353,16 @@ only restic is available. Remove BACKUP_METHOD from $CONFIG and set up restic (s
 [[ -n $REMOTE_USER ]]          || die "REMOTE_USER is missing in $CONFIG"
 [[ -n $REMOTE_HOST ]]          || die "REMOTE_HOST is missing in $CONFIG"
 [[ -n $BACKUP_NAME ]]          || die "BACKUP_NAME is missing in $CONFIG"
-(( ${#SOURCES[@]} > 0 ))       || die "SOURCES is empty"
 [[ $MIN_FREE_PERCENT =~ ^[0-9]+$ ]] && (( MIN_FREE_PERCENT <= 100 )) \
                                || die "MIN_FREE_PERCENT must be an integer from 0 to 100"
-for src in "${SOURCES[@]}"; do
-    [[ $src == /* ]] || die "Source must be an absolute path: $src"
-    [[ -e $src ]]    || die "Source does not exist: $src"
-done
+# Recovery and mail tests must also work after the original sources are lost.
+if (( ! RESTIC_PASSTHRU && ! TEST_MAIL )); then
+    (( ${#SOURCES[@]} > 0 )) || die "SOURCES is empty"
+    for src in "${SOURCES[@]}"; do
+        [[ $src == /* ]] || die "Source must be an absolute path: $src"
+        [[ -e $src ]] || die "Source does not exist: $src"
+    done
+fi
 
 # --- SSH basics --------------------------------------------------------------
 #
@@ -421,7 +431,7 @@ backup_restic() {
 
     # One snapshot per source: progress per source, failures stay isolated
     local -a failed=()
-    local n=0 src
+    local n=0 incomplete=0 src
     for src in "${SOURCES[@]}"; do
         n=$((n + 1))
         log "[$n/${#SOURCES[@]}] Backing up $src ..."
@@ -438,7 +448,8 @@ backup_restic() {
         set -e
         case $rc in
             0) log "[$n/${#SOURCES[@]}] $src done." ;;
-            3) log "[$n/${#SOURCES[@]}] $src done."
+            3) incomplete=1
+               log "[$n/${#SOURCES[@]}] $src done."
                warn "$src: some files could not be read (restic exit code 3)." ;;
             *) log "[$n/${#SOURCES[@]}] ERROR for $src (restic exit code $rc)."
                failed+=("$src") ;;
@@ -449,7 +460,9 @@ backup_restic() {
         || die "Backup $TODAY is INCOMPLETE – failed: ${failed[*]}"
 
     # Retention: only snapshots of this host; prune removes unreferenced data
-    if (( ${#RESTIC_FORGET_OPTS[@]} > 0 )); then
+    if (( incomplete )); then
+        warn "Retention skipped because files could not be read; keeping previous snapshots."
+    elif (( ${#RESTIC_FORGET_OPTS[@]} > 0 )); then
         log "Removing old snapshots (${RESTIC_FORGET_OPTS[*]}) ..."
         local -a fargs=(forget --host "$BACKUP_NAME" --prune "${RESTIC_FORGET_OPTS[@]}")
         (( DRY_RUN )) && fargs+=(--dry-run)

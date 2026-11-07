@@ -27,6 +27,13 @@
 #
 set -euo pipefail
 
+# cron starts jobs with PATH=/usr/bin:/bin – add the sbin directories so that
+# runuser, sendmail etc. are found there too
+for d in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
+    [[ ":$PATH:" == *":$d:"* ]] || PATH="$PATH:$d"
+done
+export PATH
+
 readonly SELF="$(realpath -- "$0")"
 BACKUP_SH="${BACKUP_SH:-$(dirname -- "$SELF")/backup.sh}"
 
@@ -67,10 +74,15 @@ done
 [[ -r $CONFIG ]]    || { echo "Error: configuration not readable: $CONFIG" >&2; exit 1; }
 
 MAIL_TO="" MAIL_FROM="" LOG_FILE="/dev/null" BACKUP_NAME="" SOURCES=()
-eval "$(bash -c '
+config_values="$(bash -e -c '
     MAIL_TO=""; MAIL_FROM=""; LOG_FILE="/dev/null"; BACKUP_NAME="$(hostname -s)"; SOURCES=()
     source "$1" >/dev/null 2>&1
-    declare -p MAIL_TO MAIL_FROM LOG_FILE BACKUP_NAME SOURCES' _ "$CONFIG")"
+    declare -p MAIL_TO MAIL_FROM LOG_FILE BACKUP_NAME SOURCES' _ "$CONFIG")" || {
+    echo "Error: could not load configuration: $CONFIG" >&2
+    exit 1
+}
+eval "$config_values"
+unset config_values
 touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/dev/null"
 
 CONF_FILE="$(dirname -- "$CONFIG")/nextcloud.conf"
@@ -309,7 +321,7 @@ log "$NEXTCLOUD_DIR (version ${NC_VERSION:-?}, user $NC_USER, $("$NC_PHP" -r 'ec
 
 need=("$NEXTCLOUD_DIR/config")
 [[ -n $DATA_DIR ]] && need+=("$DATA_DIR")
-(( NEXTCLOUD_DUMP )) && [[ $DB_TYPE != sqlite* ]] && need+=("$NEXTCLOUD_DUMP_DIR")
+(( NEXTCLOUD_DUMP )) && need+=("$NEXTCLOUD_DUMP_DIR")
 for path in "${need[@]}"; do
     covered=0
     for src in "${SOURCES[@]}"; do
@@ -389,11 +401,12 @@ dump_database() {
             local db="${DATA_DIR%/}/${db_name:-owncloud}.db"
             [[ -f $db ]] || die "SQLite database $db not found."
             dump="$NEXTCLOUD_DUMP_DIR/nextcloud-db.sqlite"; tmp="$dump.tmp"
-            if command -v sqlite3 >/dev/null; then
-                (umask 077; sqlite3 "$db" ".backup '$tmp'") || { rm -f -- "$tmp"; die "SQLite backup failed."; }
-            else
-                (umask 077; cp -- "$db" "$tmp") || { rm -f -- "$tmp"; die "could not copy $db."; }  # safe: maintenance mode is on
-            fi
+            command -v sqlite3 >/dev/null || die "sqlite3 not found (package sqlite3); a plain copy is unsafe with WAL databases."
+            # Quote the shell's .backup argument, including embedded quotes.
+            local sqlite_target="${tmp//\\/\\\\}"
+            sqlite_target="${sqlite_target//\"/\\\"}"
+            (umask 077; sqlite3 "$db" ".backup \"$sqlite_target\"") \
+                || { rm -f -- "$tmp"; die "SQLite backup failed."; }
             ;;
         *)
             die "unsupported database type '${DB_TYPE:-empty}'. Set NEXTCLOUD_DUMP=0 in $CONF_FILE to skip the dump."

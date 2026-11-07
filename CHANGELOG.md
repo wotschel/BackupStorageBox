@@ -3,6 +3,30 @@
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 versioning according to [SemVer](https://semver.org/).
 
+## [5.0.2] – 2026-11-07
+
+### Fixed
+- Recovery commands and mail tests no longer require existing backup sources.
+- Skip retention and pruning after restic exit code 3 to preserve earlier history.
+- Abort Nextcloud configuration loading on errors instead of continuing with defaults.
+- Require SQLite's backup function instead of falling back to a potentially
+  incomplete database file copy; check dump coverage for SQLite too.
+- Clarify storage requirements and the built-in log default in the README.
+
+### Added
+- Isolated regression tests for recovery, source validation, retention and
+  Nextcloud configuration errors.
+
+## [5.0.1] – 2026-11-07
+
+### Fixed
+- Under cron (`PATH=/usr/bin:/bin`) `runuser` and `sendmail` in `/usr/sbin`
+  were not found: `nextcloud-backup.sh` failed and failure mails were
+  silently skipped. Both scripts now add the sbin directories to `PATH`.
+
+### Added
+- README: section on running the backup via cron.
+
 ## [5.0.0] – 2026-11-07
 
 ### Removed

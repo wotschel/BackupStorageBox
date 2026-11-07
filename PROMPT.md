@@ -25,7 +25,9 @@ Requirements:
 - Dry run with `-n`, help with `-h`, version with `-V`.
 - One snapshot per source with `--host <BACKUP_NAME>`; show in the log which
   one is running (`[n/total]`), keep going if one fails and report the failed
-  sources at the end. Treat restic code 3 as a warning.
+  sources at the end. Treat restic code 3 as a warning and skip retention
+  after it to preserve previous snapshots. Recovery commands must work even
+  if the configured sources no longer exist.
 - Retention via `forget --host <BACKUP_NAME> --prune` with
   `RESTIC_FORGET_OPTS`, default staggered
   `--keep-daily 7 --keep-weekly 5 --keep-monthly 12`; empty = never delete.
@@ -62,7 +64,7 @@ Requirements:
   verified with `occ status`, falling back to other installed versions);
   enable maintenance mode, dump the database with the credentials from the
   Nextcloud configuration (MySQL/MariaDB via a temporary option file,
-  PostgreSQL, SQLite) to `/var/backups/nextcloud` (`.tmp` + `mv`), run
+  PostgreSQL, SQLite via `sqlite3 .backup`, never a plain copy) to `/var/backups/nextcloud` (`.tmp` + `mv`), run
   `backup.sh` with the given options, and always end maintenance mode in an
   EXIT trap (also on signals and if it was on before). Warn if the config,
   data or dump folder is missing from `SOURCES`. `-n`: no maintenance mode
@@ -71,6 +73,8 @@ Requirements:
   not be ended, and on warnings – not on failures of `backup.sh`, which
   mails them itself. Optional overrides in `nextcloud.conf` next to the
   backup configuration.
+- Both scripts must work under cron's minimal `PATH` (add the sbin
+  directories so `runuser` and `sendmail` are found).
 - All output, comments and documentation in English.
 
 Also provide README.md (how it works, setup, configuration, Nextcloud, mail,

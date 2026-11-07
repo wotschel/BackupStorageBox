@@ -100,7 +100,7 @@ for the Storage Box (see below).
 | `SOURCES`     | Array of directories to back up (absolute)        | –       |
 | `EXCLUDES`    | Array of restic exclude patterns                  | empty   |
 | `RESTIC_FORGET_OPTS` | Array of `restic forget` policies, `()` = never delete | `--keep-daily 7 --keep-weekly 5 --keep-monthly 12` |
-| `LOG_FILE`    | Log file                                          | `/var/log/backup.log` |
+| `LOG_FILE`    | Log file                                          | `/dev/null` (sample: `/var/log/backup.log`) |
 | `MAIL_TO`     | Mail recipients (comma-separated), see "Mail"     | empty = no mails |
 | `MAIL_FROM`   | Sender address                                    | empty = mail system default |
 | `MIN_FREE_PERCENT` | Warn below this free space on the target, `0` = off | `5` |
@@ -120,7 +120,8 @@ RESTIC_FORGET_OPTS=(--keep-daily 7 --keep-weekly 5 --keep-monthly 12)
 - the last snapshot of each of the last 5 weeks,
 - the last snapshot of each of the last 12 months.
 
-Thanks to deduplication this costs little more space than a few days. Any
+Actual storage use depends on how much data changes and how well it
+deduplicates. Any
 `restic forget` policy can be used, e.g. add `--keep-yearly 3`, or keep
 everything of the last 30 days with `(--keep-within 30d)`. With
 `RESTIC_FORGET_OPTS=()` nothing is deleted.
@@ -174,7 +175,8 @@ backup.sh [-c FILE] --restic RESTIC-ARGS...
 | `-h` / `-V` | help / version |
 
 Exit code `0` on success, `1` on error. restic code 3 (some files could not
-be read) counts as success but is a warning. Parallel runs with the same
+be read) counts as success but is a warning. In that case retention and
+pruning are skipped to preserve previous snapshots. Parallel runs with the same
 configuration are prevented by a `flock` lock.
 
 Each source is backed up separately, and the log shows the progress:
@@ -229,7 +231,9 @@ It detects automatically:
 The dump goes to `/var/backups/nextcloud/nextcloud-db.sql.gz` (SQLite:
 `nextcloud-db.sqlite`). It is first written to a `.tmp` file, so a failed
 dump never replaces the last good one; a failed dump aborts the run before
-the backup.
+the backup. SQLite requires the `sqlite3` command and uses its `.backup`
+function; a plain file copy could miss data in the WAL. Include the dump
+directory in `SOURCES` for SQLite as well.
 
 ```bash
 # Check what is detected – changes nothing
@@ -393,12 +397,41 @@ journalctl -u backup.service
 With Nextcloud, use `ExecStart=/opt/backup/nextcloud-backup.sh` instead.
 
 `Persistent=true` catches up on a missed run, e.g. if the machine was off at
-night. Alternatively via cron: `30 2 * * * /opt/backup/backup.sh`.
+night.
+
+## Running daily (cron)
+
+Instead of the systemd timer, a file in `/etc/cron.d` works too (root
+crontab format with a user column):
+
+`/etc/cron.d/backup`
+```cron
+# Daily backup at 02:30; with Nextcloud use nextcloud-backup.sh instead
+30 2 * * *  root  nice -n 10 ionice -c 3 /opt/backup/backup.sh >/dev/null 2>&1
+```
+
+```cron
+30 2 * * *  root  nice -n 10 ionice -c 3 /opt/backup/nextcloud-backup.sh >/dev/null 2>&1
+```
+
+- Everything is logged to `LOG_FILE` and failures are mailed to `MAIL_TO`, so
+  the output is discarded instead of being mailed by cron. If you have no
+  `MAIL_TO`, redirect to a file (`>>/var/log/backup-cron.log 2>&1`) to keep
+  errors that happen before the log file is opened.
+- Both scripts add `/usr/sbin` etc. to cron's minimal `PATH` themselves
+  (needed for `runuser` and `sendmail`).
+- Unlike `Persistent=true`, cron does not catch up on a run missed while the
+  machine was off.
+- Files in `/etc/cron.d` must be owned by root, not group/other-writable,
+  and their names must not contain dots.
+- Do not schedule `backup.sh` and `nextcloud-backup.sh` both – the wrapper
+  already runs the backup.
 
 ## Restoring
 
 `backup.sh --restic` passes all following arguments to restic, with
-repository, password and SSH settings taken from the configuration:
+repository, password and SSH settings taken from the configuration. The
+original `SOURCES` do not need to exist for recovery commands:
 
 ```bash
 # List snapshots
@@ -448,3 +481,13 @@ cd /mnt/restore && zcat /tmp/.backup-perms.facl.gz | sudo setfacl --restore=-
   `--read-data-subset 5%` to also read part of the data).
 - Dump databases beforehand and back up the dump, not the live files – in a
   wrapper script, see "Own steps before and after the backup".
+
+## Development checks
+
+```bash
+bash -n backup.sh nextcloud-backup.sh
+python3 -m unittest discover -s tests -v
+```
+
+The regression tests use a fake restic executable and temporary configuration
+files; they do not connect to a repository or run a real backup.
