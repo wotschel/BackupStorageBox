@@ -23,8 +23,8 @@ Requirements:
   repository so it survives `git pull` or a fresh clone; changeable via `-c`
   or `BACKUP_CONF`). Preserve
   source paths at the target (`--relative`).
-- Option `--init-config` creates a commented sample configuration (the repo
-  allows only four files per script, so no separate sample file).
+- Option `--init-config` creates a commented sample configuration (embedded
+  in the script, so a single file is enough to get started).
 - Dry run with `-n`, help with `-h`, version with `-V`.
 - Delete old backups after `KEEP_DAYS` (0 = never).
 - Prevent parallel runs via `flock`, treat rsync code 24 as success, log with
@@ -76,8 +76,22 @@ Requirements:
   `--test-mail` sends a test mail. Before the backup, check the free space
   on the target with `df` in sftp (no shell needed) and warn below
   `MIN_FREE_PERCENT` (default 5, 0 = off); if `df` fails, only log a note.
+- Ready-made hooks in the repository: `hooks/pre.d/10-nextcloud` and
+  `hooks/post.d/90-nextcloud`. The pre hook detects the installation
+  (folder with `occ`), its user (owner of `config/config.php`) and the PHP
+  version the web server uses (running php-fpm, Apache mod_php, FPM sockets
+  in the web server configuration; verified with `occ status`, falling back
+  to other installed versions), enables maintenance mode and dumps the
+  database with the credentials from the Nextcloud configuration
+  (MySQL/MariaDB via a temporary option file, PostgreSQL, SQLite) to
+  `/var/backups/nextcloud` (`.tmp` + `mv`). It warns if the config, data or
+  dump folder is missing from `SOURCES` and has a `--check` mode. The post
+  hook always ends maintenance mode (also if it was on before), using the
+  installation, user and PHP binary the pre hook stored in a state file in
+  `/var/lib/backup`. Optional overrides in
+  `/etc/backup/nextcloud.conf`.
 - All output, comments and documentation in English.
 
-Also provide README.md (how it works, setup, configuration, systemd timer,
-restoring), CHANGELOG.md and this PROMPT.md, all in the subfolder `backup/`
-of the private repo `scripts`.
+Also provide README.md (how it works, setup, configuration, hooks, mail,
+systemd timer, restoring), CHANGELOG.md and this PROMPT.md in the repository
+`BackupStorageBox`.

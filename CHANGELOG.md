@@ -3,6 +3,26 @@
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 versioning according to [SemVer](https://semver.org/).
 
+## [3.6.0] – 2026-11-07
+
+### Added
+- Ready-made Nextcloud hooks `hooks/pre.d/10-nextcloud` and
+  `hooks/post.d/90-nextcloud`:
+  - detect installation, web server user and the PHP version in use
+    (php-fpm, Apache mod_php, web server configuration; verified with
+    `occ status`, falls back to other installed versions)
+  - maintenance mode on before, always off after the backup – also after a
+    failed one and if it was already on before
+  - database dump with the credentials from the Nextcloud configuration
+    (MySQL/MariaDB, PostgreSQL, SQLite) to `/var/backups/nextcloud`
+  - warn if config, data or dump folder is missing from `SOURCES`
+  - `--check` shows what was detected without changing anything
+  - optional overrides in `/etc/backup/nextcloud.conf`
+
+### Changed
+- PROMPT.md: dropped the four-files-per-script rule from the original
+  `scripts` repository
+
 ## [3.5.0] – 2026-11-07
 
 ### Added

@@ -245,10 +245,10 @@ missing (as does `--init-config`):
 ```
 /etc/backup/hooks/
 ├── pre.d/      before the backup
-│   ├── 10-nextcloud-maintenance-on
+│   ├── 10-nextcloud
 │   └── 20-mysqldump
 └── post.d/     after the backup – always
-    └── 90-nextcloud-maintenance-off
+    └── 90-nextcloud
 ```
 
 - Files run in lexical order, so prefix them with numbers. Their output
@@ -277,19 +277,91 @@ missing (as does `--init-config`):
   post hooks run. Under systemd the running hook receives the `SIGTERM`
   itself.
 
-### Example: Nextcloud with MariaDB/MySQL
+### Included hook: Nextcloud
 
-`pre.d/10-nextcloud-maintenance-on`
+The repository contains a ready-made pair of hooks for Nextcloud:
+
+| Hook | Does |
+|---|---|
+| `hooks/pre.d/10-nextcloud` | maintenance mode on, database dump |
+| `hooks/post.d/90-nextcloud` | maintenance mode off – also after a failed backup |
+
+It detects automatically:
+
+- the **installation** (folder with `occ` under `/var/www`, `/srv`, `/opt`),
+- the **user** occ runs as (owner of `config/config.php`, usually `www-data`),
+- the **PHP version** the web server uses: running php-fpm, Apache
+  mod_php and the FPM sockets in the nginx/Apache configuration. The choice
+  is verified with `occ status`; if that PHP cannot run this Nextcloud, the
+  other installed versions are tried,
+- the **database** and its credentials from the Nextcloud configuration:
+  MySQL/MariaDB (`mariadb-dump`/`mysqldump`, password via a temporary option
+  file, never on the command line), PostgreSQL (`pg_dump`) or SQLite.
+
+The dump goes to `/var/backups/nextcloud/nextcloud-db.sql.gz` (SQLite:
+`nextcloud-db.sqlite`). It is first written to a `.tmp` file, so a failed
+dump never replaces the last good one, and it aborts the backup.
+
+The post hook **always** ends the maintenance mode, also if it was already
+on before the backup. Do not let a backup run during an upgrade. The pre
+hook passes the detected installation, user and PHP binary to the post hook
+in `/var/lib/backup/nextcloud.state`.
+
+The pre hook warns in the log if the Nextcloud `config` folder, the data
+directory or the dump folder is missing from `SOURCES`.
+
 ```bash
-#!/bin/sh
-set -e
-sudo -u www-data php /var/www/nextcloud/occ maintenance:mode --on
+# Install (from the repository clone)
+sudo install -m 755 -o root -g root hooks/pre.d/10-nextcloud  /etc/backup/hooks/pre.d/
+sudo install -m 755 -o root -g root hooks/post.d/90-nextcloud /etc/backup/hooks/post.d/
+
+# Check what was detected – changes nothing
+sudo BACKUP_CONFIG=/etc/backup/backup.conf /etc/backup/hooks/pre.d/10-nextcloud --check
 ```
+
+Example output of `--check`:
+
+```
+Nextcloud: /var/www/nextcloud (version 30.0.2.1, user www-data, PHP 8.3.6, database mysql)
+Nextcloud: WARNING: /var/backups/nextcloud is not in SOURCES of /etc/backup/backup.conf – it will not be backed up.
+Nextcloud: maintenance mode is currently false; data directory /srv/nextcloud-data.
+Nextcloud: check only – a real run would enable maintenance mode and dump the database to /var/backups/nextcloud.
+```
+
+`SOURCES` then needs at least:
+
+```bash
+SOURCES=(
+    "/var/www/nextcloud"        # installation incl. config/ and apps
+    "/srv/nextcloud-data"       # data directory (datadirectory in config.php)
+    "/var/backups/nextcloud"    # database dump
+)
+```
+
+If the detection picks the wrong thing, override it in
+`/etc/backup/nextcloud.conf` (owned by root, sourced as Bash):
+
+```bash
+NEXTCLOUD_DIR="/var/www/nextcloud"
+NEXTCLOUD_PHP="/usr/bin/php8.3"
+NEXTCLOUD_DUMP=1                            # 0 = maintenance mode only
+NEXTCLOUD_DUMP_DIR="/var/backups/nextcloud"
+```
+
+Not supported: snap and Docker installations.
+
+The installed hooks are copies: after a `git pull`, install them again to
+get updates.
+
+### Writing your own hooks
+
+A hook is any executable file. For example, dumping all MySQL/MariaDB
+databases:
 
 `pre.d/20-mysqldump` – the dump folder must be in `SOURCES`
 ```bash
-#!/bin/sh
-set -e
+#!/bin/bash
+set -eo pipefail
 umask 077
 mkdir -p /var/backups/mysql
 # Credentials from /root/.my.cnf (or socket authentication as root)
@@ -298,22 +370,9 @@ mysqldump --all-databases --single-transaction --routines --events \
 mv /var/backups/mysql/all-databases.sql.gz.tmp /var/backups/mysql/all-databases.sql.gz
 ```
 
-`post.d/90-nextcloud-maintenance-off`
-```bash
-#!/bin/sh
-sudo -u www-data php /var/www/nextcloud/occ maintenance:mode --off
-```
-
-```bash
-sudo chmod 755 /etc/backup/hooks/*/*
-sudo chown root:root /etc/backup/hooks/*/*
-# and in backup.conf: SOURCES+=("/var/backups/mysql")
-```
-
-Without `pipefail` in `sh`, a failing `mysqldump` would not be noticed in
-the pipe; with Bash use `#!/bin/bash` and `set -eo pipefail` instead. The
+`pipefail` makes a failing `mysqldump` fail the hook despite the pipe; the
 `.tmp` file and `mv` make sure a broken dump never replaces the last good
-one.
+one. Install your own hooks with owner root and mode 755 as well.
 
 ## Mail notification
 
