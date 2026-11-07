@@ -43,6 +43,16 @@ Requirements:
   `acl` are available; install missing packages as root via `apt-get`,
   otherwise (without root, without apt, during a dry run) abort with a clear
   message.
+- Alternatively back up with restic, selected via `BACKUP_METHOD="rsync"` or
+  `"restic"` in the configuration (default rsync): repository via SFTP at
+  `RESTIC_REPO_PATH` (default `<REMOTE_BASE>/restic-<BACKUP_NAME>`), port and
+  key through `-o sftp.command`, password from `RESTIC_PASSWORD_FILE`;
+  initialize the repository on the first run (not in a dry run); one snapshot
+  per source with `--host <BACKUP_NAME>` and `[n/total]` progress; retention
+  via `forget --prune` with `--keep-within <KEEP_DAYS>d` or
+  `RESTIC_FORGET_OPTS`; treat restic code 3 as a warning; `--restic ARGS...`
+  passes arguments to restic with the configured settings (for restore etc.);
+  install `restic` like the other dependencies.
 - All output, comments and documentation in English.
 
 Also provide README.md (how it works, setup, configuration, systemd timer,

@@ -3,6 +3,24 @@
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 versioning according to [SemVer](https://semver.org/).
 
+## [3.1.0] – 2026-11-07
+
+### Added
+- `BACKUP_METHOD` in the configuration selects `rsync` (default, unchanged
+  behavior) or `restic`
+- restic method: encrypted, deduplicated snapshots via SFTP in
+  `RESTIC_REPO_PATH` (default `<REMOTE_BASE>/restic-<BACKUP_NAME>`), password
+  from `RESTIC_PASSWORD_FILE`; the repository is initialized on the first run;
+  one snapshot per source with progress in the log; retention via
+  `forget --prune` with `KEEP_DAYS` or `RESTIC_FORGET_OPTS`; restic code 3
+  (unreadable files) is logged as a warning
+- `--restic ARGS...` runs restic with the configured repository, password and
+  SSH settings (snapshots, restore, mount, check, ...)
+- Dependency check installs `restic` when needed
+
+### Changed
+- rsync and acl are only required for the rsync method
+
 ## [3.0.0] – 2026-11-07
 
 ### Changed
