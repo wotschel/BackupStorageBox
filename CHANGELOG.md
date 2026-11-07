@@ -22,6 +22,9 @@ versioning according to [SemVer](https://semver.org/).
   with explicit placeholders.
 - The sample configuration from `--init-config` also backs up `/var`
   (excluding `/var/cache`, `/var/tmp` and `/var/lib/apt/lists`).
+- The sample configuration's `SSH_KEY` defaults to
+  `/root/.ssh/backup_<hostname -s>_ed25519`, matching the setup instructions
+  (key deployed with `install-ssh-key`).
 - Default log path is `/var/log/backup/backup.log`; new files/directories use
   restrictive permissions. Existing configured paths remain supported.
 - Mail excerpts select the run ID instead of byte offsets in a shared log.

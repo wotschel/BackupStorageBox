@@ -58,13 +58,10 @@ Replace `YOUR_STORAGEBOX_USER` below with your Storage Box username.
 
 ```bash
 # 1. Create an SSH key for the backup and deploy it to the Storage Box
-sudo ssh-keygen -t ed25519 -N "" -C "backup@$(hostname)" -f /root/.ssh/backup_$(hostname)_ed25519
-
-sudo ssh -p 23 username@servername.your-storagebox.de
-
-sudo cat /root/.ssh/backup_$(hostname)_ed25519.pub \
-  | sudo ssh -p 23 username@servername.your-storagebox.de install-ssh-key
-
+#    (asks once for the Storage Box password and to accept its host key)
+sudo ssh-keygen -t ed25519 -N "" -C "backup@$(hostname -s)" -f "/root/.ssh/backup_$(hostname -s)_ed25519"
+sudo cat "/root/.ssh/backup_$(hostname -s)_ed25519.pub" \
+  | sudo ssh -p 23 YOUR_STORAGEBOX_USER@YOUR_STORAGEBOX_USER.your-storagebox.de install-ssh-key
 
 # 2. Clone the repository and link the script
 sudo git clone https://github.com/wotschel/BackupStorageBox.git /opt/backup
@@ -144,7 +141,7 @@ Replace `YOUR_STORAGEBOX_USER` and `YOUR_STORAGEBOX_SUBACCOUNT` in the examples
 with your own account details before running commands or using the configuration.
 
 The sample configuration from `--init-config` is already set up for the
-Storage Box (port 23, key `/root/.ssh/backup_ed25519`), using the placeholder
+Storage Box (port 23, key `/root/.ssh/backup_<hostname -s>_ed25519`), using the placeholder
 `YOUR_STORAGEBOX_USER`. The host is
 derived from `REMOTE_USER`:
 

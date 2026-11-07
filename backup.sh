@@ -169,7 +169,7 @@ config_template() {
 REMOTE_USER="YOUR_STORAGEBOX_USER"           # replace with your Storage Box user
 REMOTE_HOST="${REMOTE_USER}.your-storagebox.de"
 SSH_PORT=23                     # Storage Box SSH/SFTP port
-SSH_KEY="/root/.ssh/backup_ed25519"   # empty = ssh default key (path without spaces)
+SSH_KEY="/root/.ssh/backup_$(hostname -s)_ed25519"   # empty = ssh default key (path without spaces)
 
 # --- Name of this machine (restic host name of its snapshots) ---
 BACKUP_NAME="$(hostname -s)"
