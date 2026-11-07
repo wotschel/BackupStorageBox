@@ -49,8 +49,9 @@ Requirements:
   key through `-o sftp.command`, password from `RESTIC_PASSWORD_FILE`;
   initialize the repository on the first run (not in a dry run); one snapshot
   per source with `--host <BACKUP_NAME>` and `[n/total]` progress; retention
-  via `forget --prune` with `--keep-within <KEEP_DAYS>d` or
-  `RESTIC_FORGET_OPTS`; treat restic code 3 as a warning; `--restic ARGS...`
+  via `forget --prune` with `RESTIC_FORGET_OPTS`, default staggered
+  `--keep-daily 7 --keep-weekly 5 --keep-monthly 12` (if empty, fall back to
+  `--keep-within <KEEP_DAYS>d`); treat restic code 3 as a warning; `--restic ARGS...`
   passes arguments to restic with the configured settings (for restore etc.);
   install `restic` like the other dependencies.
 - All output, comments and documentation in English.

@@ -11,7 +11,7 @@ two methods selected in the configuration (`BACKUP_METHOD`):
 | Deduplication | whole unchanged files only | blocks, across files and renames |
 | Compression | no | yes |
 | Owners/groups on the Storage Box | via `getfacl` file, restored with `--restore-perms` | stored in the repository |
-| Retention | `KEEP_DAYS` | `KEEP_DAYS` or staggered (`RESTIC_FORGET_OPTS`) |
+| Retention | `KEEP_DAYS` (30 days) | staggered: 7 daily, 5 weekly, 12 monthly (`RESTIC_FORGET_OPTS`) |
 
 Both methods run **no shell commands** on the target – only rsync or SFTP – so
 restricted targets like the Hetzner Storage Box work.
@@ -47,7 +47,8 @@ The repository is reached via SFTP at `RESTIC_REPO_PATH` (default
 The first run initializes it automatically. Each source becomes its own
 snapshot (host = `BACKUP_NAME`), so the log shows progress per source and a
 failing source does not affect the others. Afterwards
-`restic forget --prune` removes old snapshots of this host.
+`restic forget --prune` removes old snapshots of this host according to the
+staggered retention (see "Configuration").
 
 The repository password is read from `RESTIC_PASSWORD_FILE` (default
 `/etc/backup/restic.pass`). **Without this password all backups are lost** –
@@ -115,7 +116,7 @@ for the Storage Box (see below).
 | `BACKUP_NAME` | Folder (rsync) or restic host name per machine    | `hostname -s` |
 | `SOURCES`     | Array of directories to back up (absolute)        | –       |
 | `EXCLUDES`    | Array of exclude patterns                         | empty   |
-| `KEEP_DAYS`   | Retention in days, `0` = never delete             | `30`    |
+| `KEEP_DAYS`   | rsync retention in days, `0` = never delete       | `30`    |
 | `LOG_FILE`    | Log file                                          | `/var/log/backup.log` |
 | **rsync only** | | |
 | `RSYNC_OPTS`  | rsync options                                     | `-aHAX --numeric-ids --delete --delete-excluded` |
@@ -123,7 +124,7 @@ for the Storage Box (see below).
 | **restic only** | | |
 | `RESTIC_REPO_PATH` | Repository path on the target                | `<REMOTE_BASE>/restic-<BACKUP_NAME>` |
 | `RESTIC_PASSWORD_FILE` | File containing the repository password  | `/etc/backup/restic.pass` |
-| `RESTIC_FORGET_OPTS` | Array of `restic forget` policies; replaces `KEEP_DAYS` | empty |
+| `RESTIC_FORGET_OPTS` | Array of `restic forget` policies           | `--keep-daily 7 --keep-weekly 5 --keep-monthly 12` |
 
 `EXCLUDES` are rsync patterns; for restic a trailing `/` is dropped
 (`.cache/` becomes `.cache`, which restic matches as a name anywhere).
@@ -131,11 +132,22 @@ for the Storage Box (see below).
 `-A` (ACLs) and `-X` (extended attributes) in `RSYNC_OPTS` require root on the
 target server. If you write there as a regular user, remove them.
 
-Staggered retention with restic, e.g. a year of history:
+### restic retention
+
+By default restic keeps a staggered history of about one year:
 
 ```bash
 RESTIC_FORGET_OPTS=(--keep-daily 7 --keep-weekly 5 --keep-monthly 12)
 ```
+
+- the last snapshot of each of the last 7 days,
+- the last snapshot of each of the last 5 weeks,
+- the last snapshot of each of the last 12 months.
+
+Thanks to deduplication this costs little more space than a few days. Any
+`restic forget` policy can be used (e.g. add `--keep-yearly 3`). With
+`RESTIC_FORGET_OPTS=()` restic falls back to `KEEP_DAYS`
+(`--keep-within <KEEP_DAYS>d`); with both empty/`0`, nothing is deleted.
 
 Several machines may share one restic repository (same `RESTIC_REPO_PATH`
 and password) to deduplicate across them; snapshots and retention stay

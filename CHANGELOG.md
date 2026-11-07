@@ -3,6 +3,14 @@
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 versioning according to [SemVer](https://semver.org/).
 
+## [3.2.0] – 2026-11-07
+
+### Changed
+- restic now uses a staggered retention by default:
+  `RESTIC_FORGET_OPTS=(--keep-daily 7 --keep-weekly 5 --keep-monthly 12)`
+  (about one year of history). `KEEP_DAYS` only applies to restic when
+  `RESTIC_FORGET_OPTS=()` is set; the rsync method is unchanged
+
 ## [3.1.0] – 2026-11-07
 
 ### Added

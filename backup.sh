@@ -13,7 +13,7 @@
 #
 set -euo pipefail
 
-readonly VERSION="3.1.0"
+readonly VERSION="3.2.0"
 # Kept outside the script directory, so the repository can be updated or
 # re-cloned at any time without touching the configuration.
 readonly DEFAULT_CONFIG="/etc/backup/backup.conf"
@@ -123,8 +123,9 @@ EXCLUDES=(
     "node_modules/"
 )
 
-# --- Retention in days (0 = never delete) ---
-# restic: used as "forget --keep-within <KEEP_DAYS>d" unless RESTIC_FORGET_OPTS is set
+# --- Retention in days for rsync (0 = never delete) ---
+# restic uses RESTIC_FORGET_OPTS below; KEEP_DAYS only applies there if
+# RESTIC_FORGET_OPTS is empty (as "forget --keep-within <KEEP_DAYS>d")
 KEEP_DAYS=30
 
 # --- Log file ---
@@ -159,9 +160,10 @@ RESTIC_REPO_PATH="${REMOTE_BASE%/}/restic-${BACKUP_NAME}"
 #   sudo sh -c 'umask 077; head -c 32 /dev/urandom | base64 > /etc/backup/restic.pass'
 RESTIC_PASSWORD_FILE="/etc/backup/restic.pass"
 
-# Retention instead of KEEP_DAYS, e.g. staggered:
-#   RESTIC_FORGET_OPTS=(--keep-daily 7 --keep-weekly 5 --keep-monthly 12)
-RESTIC_FORGET_OPTS=()
+# Staggered retention: last 7 days daily, last 5 weeks weekly, last 12 months
+# monthly (about one year of history). Empty () = use KEEP_DAYS instead;
+# empty and KEEP_DAYS=0 = never delete.
+RESTIC_FORGET_OPTS=(--keep-daily 7 --keep-weekly 5 --keep-monthly 12)
 EOF
 }
 
@@ -252,7 +254,7 @@ SOURCES=(); EXCLUDES=(); KEEP_DAYS=30; SAVE_PERMS=1
 RSYNC_OPTS=(-aHAX --numeric-ids --delete --delete-excluded)
 RESTIC_REPO_PATH=""
 RESTIC_PASSWORD_FILE="/etc/backup/restic.pass"
-RESTIC_FORGET_OPTS=()
+RESTIC_FORGET_OPTS=(--keep-daily 7 --keep-weekly 5 --keep-monthly 12)
 
 # shellcheck source=/dev/null
 source "$CONFIG"
