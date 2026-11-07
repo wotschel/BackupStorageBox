@@ -75,6 +75,11 @@ Requirements:
   remain inactive and generate a migration warning.
 - Work under cron's minimal `PATH` (add the sbin directories so `sendmail`
   and commands used by custom actions are found).
+- Provide installable `units/backup.service` and `units/backup.timer` for daily
+  root backups at 02:30 local time, randomized delay 15 minutes and persistent
+  catch-up. Service runs `/opt/backup/backup.sh`, logs to the journal, has no
+  startup time limit and allows five minutes to stop. Document installation,
+  verification, schedule/config overrides, updates and disabling the timer.
 - All output, comments and documentation in English.
 
 Also provide README.md (how it works, setup, configuration, local actions, mail,

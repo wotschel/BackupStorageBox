@@ -6,6 +6,8 @@ versioning according to [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Installable systemd service/timer in `units/`, with scheduling, drop-in
+  customization, update and troubleshooting instructions.
 - Structured logging with ISO timestamps, severity, unique run IDs and phases,
   including captured restic/action output and action duration/exit codes.
 - Final status and source counts after post actions, including failure paths.

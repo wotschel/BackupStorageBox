@@ -446,43 +446,143 @@ Storage Box snapshots count towards the quota as well.
 
 ## Running daily (systemd timer)
 
-`/etc/systemd/system/backup.service`
-```ini
-[Unit]
-Description=Daily backup
-Wants=network-online.target
-After=network-online.target
+Ready-to-install units are included in [`units/`](units/):
 
-[Service]
-Type=oneshot
-ExecStart=/opt/backup/backup.sh
-Nice=10
-IOSchedulingClass=idle
+| File | Purpose |
+|---|---|
+| [`backup.service`](units/backup.service) | Runs `/opt/backup/backup.sh` as root, including local pre/post actions, with low CPU/I/O priority and console output in the journal |
+| [`backup.timer`](units/backup.timer) | Starts the service daily at 02:30 in the machine's local timezone, with up to 15 minutes of randomized delay |
+
+### Install and enable the units
+
+Run these steps on the machine that should perform the backup. The commands
+assume the repository is installed at `/opt/backup`, systemd is running, and
+you have sudo access. The service uses `/etc/backup/backup.conf`.
+
+**1. Prepare and check the backup configuration.** Configure the target,
+password file, SSH key and sources as described in the setup section. Verify
+that the script is executable and test a dry run:
+
+```bash
+sudo chmod +x /opt/backup/backup.sh
+sudo /opt/backup/backup.sh -n
 ```
 
-`/etc/systemd/system/backup.timer`
-```ini
-[Unit]
-Description=Daily backup
+Resolve errors before enabling the timer. A dry run skips pre/post actions,
+so test your custom actions separately as appropriate. Remove any existing
+cron entry for this backup to avoid scheduling it twice.
 
-[Timer]
-OnCalendar=*-*-* 02:30
-RandomizedDelaySec=15min
-Persistent=true
+**2. Copy the unit files into systemd's configuration directory.** `install`
+copies the files and sets their permissions; it does not start the backup:
 
-[Install]
-WantedBy=timers.target
+```bash
+sudo install -o root -g root -m 644 /opt/backup/units/backup.service /etc/systemd/system/backup.service
+sudo install -o root -g root -m 644 /opt/backup/units/backup.timer /etc/systemd/system/backup.timer
 ```
+
+If the repository is located elsewhere, adjust the source paths in these
+commands and set the service's `ExecStart` to the actual script path using
+the drop-in instructions below, before continuing. A different backup
+configuration can also be selected there with `-c`.
+
+**3. Validate the units and tell systemd to reload them.**
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now backup.timer
-systemctl list-timers backup.timer
-journalctl -u backup.service
+sudo systemd-analyze verify backup.service backup.timer
 ```
 
-`Persistent=true` catches up on a missed run, e.g. if the machine was off at
-night.
+The verification should report no errors. Fix missing executable paths or
+invalid settings before proceeding. If you change a unit or drop-in, reload
+systemd again.
+
+**4. Enable and start the timer.** This activates scheduling immediately and
+makes the timer start automatically at boot:
+
+```bash
+sudo systemctl enable --now backup.timer
+```
+
+**5. Check that scheduling is active.**
+
+```bash
+systemctl is-enabled backup.timer
+systemctl is-active backup.timer
+systemctl list-timers --all backup.timer
+```
+
+The first two commands should print `enabled` and `active`. The timer list
+shows the next run in `NEXT` and the service it activates in `ACTIVATES`.
+`backup.service` being `inactive (dead)` between successful runs is normal:
+it is a oneshot service and does not stay running.
+
+Enable the **timer**, which starts the service as scheduled. `Persistent=true`
+catches up on a missed run when the timer becomes active again, for example
+after the machine was off at night; enabling it may therefore trigger a backup
+soon afterwards. An already running service is not started a second time.
+Use either this timer or cron for the backup, and remove any duplicate cron job.
+
+Run a backup manually or inspect its status and logs:
+
+```bash
+sudo systemctl start backup.service
+systemctl status backup.service backup.timer
+sudo journalctl -u backup.service -n 100 --no-pager
+sudo tail -n 50 /var/log/backup/backup.log
+```
+
+`systemctl start` performs a real backup and normally waits for completion.
+The service has no startup time limit, so large backups can finish. On stop,
+`TimeoutStopSec=5min` allows up to five minutes for termination and cleanup
+before systemd forcibly kills remaining processes; forced termination cannot
+guarantee post actions complete.
+
+### Change the schedule or configuration
+
+Use systemd drop-ins so local settings are separate from the supplied units.
+To change the time, run `sudo systemctl edit backup.timer` and add:
+
+```ini
+[Timer]
+OnCalendar=
+OnCalendar=*-*-* 04:00:00
+RandomizedDelaySec=10min
+```
+
+The empty `OnCalendar=` clears the original schedule. To change the script
+location or backup configuration, run `sudo systemctl edit backup.service`:
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/opt/backup/backup.sh -c /etc/backup/other.conf
+```
+
+Replace `/opt/backup/backup.sh` here if the repository lives elsewhere. Reload
+and restart the timer after edits:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart backup.timer
+systemctl list-timers --all backup.timer
+```
+
+Changes to the service apply to its next run; restarting the timer does not
+restart an active backup. A `git pull` does not update installed copies of the
+units: repeat the install commands and reload systemd when unit files change.
+Drop-ins created with `systemctl edit` remain in place.
+
+To disable future scheduled runs:
+
+```bash
+sudo systemctl disable --now backup.timer
+```
+
+This leaves an active backup running. Stop it separately, if needed, with
+`sudo systemctl stop backup.service`.
+
+See the systemd documentation for [timer behavior](https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html)
+and [service settings](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html).
 
 ## Running daily (cron)
 
@@ -570,3 +670,40 @@ python3 -m unittest discover -s tests -v
 
 The regression tests use a fake restic executable and temporary configuration
 files; they do not connect to a repository or run a real backup.
+
+## Restic command reference
+
+All commands below use `backup.sh --restic` so repository, password file and
+SSH settings come from the backup configuration. For a different configuration,
+put `-c /path/to/backup.conf` **before** `--restic`. These commands do not run
+pre/post actions or apply the configured retention policy automatically.
+
+Replace `SNAPSHOT_ID`, `OLDER_ID`, `NEWER_ID` and `BACKUP_NAME` with actual
+values. Each source has its own snapshot: `latest` alone selects only the
+newest snapshot, not all sources. In a shared repository, select the host
+explicitly; `BACKUP_NAME` from the configuration is not automatically applied
+to passthrough commands.
+
+| Purpose | Command |
+|---|---|
+| List all snapshots | `sudo backup.sh --restic snapshots` |
+| List one machine's snapshots | `sudo backup.sh --restic snapshots --host BACKUP_NAME` |
+| List paths in a snapshot | `sudo backup.sh --restic ls SNAPSHOT_ID` |
+| Find a file across snapshots | `sudo backup.sh --restic find '*/fstab'` |
+| Compare two snapshots of the same source | `sudo backup.sh --restic diff OLDER_ID NEWER_ID` |
+| Show the size needed to restore a snapshot | `sudo backup.sh --restic stats SNAPSHOT_ID --mode restore-size` |
+| Restore a snapshot to a separate directory | `sudo backup.sh --restic restore SNAPSHOT_ID --target /mnt/restore` |
+| Restore the latest `/etc` snapshot for one machine | `sudo backup.sh --restic restore latest --host BACKUP_NAME --path /etc --target /mnt/restore` |
+| Restore one file | `sudo backup.sh --restic restore SNAPSHOT_ID --include /etc/fstab --target /mnt/restore` |
+| Print a backed-up file to stdout | `sudo backup.sh --restic dump SNAPSHOT_ID /etc/fstab` |
+| Browse snapshots through FUSE (create the mount directory first; foreground) | `sudo backup.sh --restic mount /mnt/restic` |
+| Check repository structure | `sudo backup.sh --restic check` |
+| Check structure and read a random 5% of stored data packs | `sudo backup.sh --restic check --read-data-subset 5%` |
+| Check structure and read all stored data | `sudo backup.sh --restic check --read-data` |
+| Preview the default retention policy for one machine without deleting snapshots | `sudo backup.sh --restic forget --host BACKUP_NAME --keep-daily 7 --keep-weekly 5 --keep-monthly 12 --dry-run` |
+| Show help for a command | `sudo backup.sh --restic restore --help` |
+
+Restore targets receive the saved paths, for example
+`/mnt/restore/etc/fstab`. For `mount`, create `/mnt/restic` beforehand with
+`sudo mkdir -p /mnt/restic`; FUSE support must be available. Full data checks
+can take considerable time and transfer data from the remote repository.
