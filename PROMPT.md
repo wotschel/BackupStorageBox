@@ -65,26 +65,10 @@ Requirements:
   and writable permissions when executing as root. Ignore user action files in
   Git but track directory placeholders and a guide. Old hooks/pre.d and post.d
   remain inactive and generate a migration warning.
-- Wrapper `nextcloud-backup.sh [--check] [backup.sh options]` next to
-  `backup.sh`: detect the installation (folder with `occ`), its user (owner
-  of `config/config.php`) and the PHP version the web server uses (running
-  php-fpm, Apache mod_php, FPM sockets in the web server configuration;
-  verified with `occ status`, falling back to other installed versions);
-  enable maintenance mode, dump the database with the credentials from the
-  Nextcloud configuration (MySQL/MariaDB via a temporary option file,
-  PostgreSQL, SQLite via `sqlite3 .backup`, never a plain copy) to `/var/backups/nextcloud` (`.tmp` + `mv`), run
-  `backup.sh` with the given options, and always end maintenance mode in an
-  EXIT trap (also on signals and if it was on before). Warn if the config,
-  data or dump folder is missing from `SOURCES`. `-n`: no maintenance mode
-  and no dump, `backup.sh -n`. Mail to `MAIL_TO` of the backup
-  configuration on failures before the backup, when maintenance mode could
-  not be ended, and on warnings – not on failures of `backup.sh`, which
-  mails them itself. Optional overrides in `nextcloud.conf` next to the
-  backup configuration.
-- Both scripts must work under cron's minimal `PATH` (add the sbin
-  directories so `runuser` and `sendmail` are found).
+- Work under cron's minimal `PATH` (add the sbin directories so `sendmail`
+  and commands used by custom actions are found).
 - All output, comments and documentation in English.
 
-Also provide README.md (how it works, setup, configuration, Nextcloud, mail,
+Also provide README.md (how it works, setup, configuration, local actions, mail,
 systemd timer, restoring), CHANGELOG.md and this PROMPT.md in the repository
 `BackupStorageBox`.

@@ -3,6 +3,14 @@
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 versioning according to [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Removed
+- `nextcloud-backup.sh` and its setup instructions. Application-specific
+  preparation and cleanup belong in local `wrappers/pre/` and `wrappers/post/`
+  scripts. Existing scheduled calls to the Nextcloud wrapper must be updated
+  to `backup.sh` after implementing the required local actions.
+
 ## [5.1.0] – 2026-11-07
 
 ### Added

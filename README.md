@@ -8,8 +8,6 @@ over SFTP to a remote server, preset for the Hetzner Storage Box:
 - one snapshot per source, owners, groups, permissions, ACLs and extended
   attributes included
 - **staggered retention**: 7 daily, 5 weekly, 12 monthly snapshots
-- **Nextcloud wrapper** `nextcloud-backup.sh`: maintenance mode, database
-  dump, backup, maintenance mode off – fully automatic
 - **mail** on failure, on warnings and when the target runs out of space
 
 The script runs **no shell commands** on the target – only SFTP – so
@@ -33,8 +31,7 @@ A run consists of:
 5. mail if something failed or there were warnings.
 
 Custom actions such as database dumps or application maintenance can run
-directly through `wrappers/pre/` and `wrappers/post/`. For the complete
-Nextcloud workflow, use `nextcloud-backup.sh`; see "Nextcloud".
+directly through `wrappers/pre/` and `wrappers/post/`.
 
 The repository password is read from `RESTIC_PASSWORD_FILE` (default
 `/etc/backup/restic.pass`). **Without this password all backups are lost** –
@@ -207,92 +204,6 @@ lines and restic's error messages are still logged.
 Without a terminal (systemd, cron, output redirected) `-v` is ignored with a
 note, so the journal stays clean.
 
-## Nextcloud
-
-`nextcloud-backup.sh` wraps `backup.sh` for a server running Nextcloud:
-
-1. detects the installation, its user, the PHP version in use and the
-   database,
-2. enables maintenance mode and dumps the database,
-3. runs `backup.sh` (from the same directory) with all given options,
-4. **always** ends maintenance mode afterwards – also after a failed backup,
-   `Ctrl+C` or `systemctl stop`, and also if it was already on before.
-   Do not let a backup run during an upgrade.
-
-It detects automatically:
-
-- the **installation** (folder with `occ` under `/var/www`, `/srv`, `/opt`),
-- the **user** occ runs as (owner of `config/config.php`, usually `www-data`),
-- the **PHP version** the web server uses: running php-fpm, Apache
-  mod_php and the FPM sockets in the nginx/Apache configuration. The choice
-  is verified with `occ status`; if that PHP cannot run this Nextcloud, the
-  other installed versions are tried,
-- the **database** and its credentials from the Nextcloud configuration:
-  MySQL/MariaDB (`mariadb-dump`/`mysqldump`, password via a temporary option
-  file, never on the command line), PostgreSQL (`pg_dump`) or SQLite.
-
-The dump goes to `/var/backups/nextcloud/nextcloud-db.sql.gz` (SQLite:
-`nextcloud-db.sqlite`). It is first written to a `.tmp` file, so a failed
-dump never replaces the last good one; a failed dump aborts the run before
-the backup. SQLite requires the `sqlite3` command and uses its `.backup`
-function; a plain file copy could miss data in the WAL. Include the dump
-directory in `SOURCES` for SQLite as well.
-
-```bash
-# Check what is detected – changes nothing
-sudo /opt/backup/nextcloud-backup.sh --check
-
-# Dry run: no maintenance mode, no dump, "backup.sh -n"
-sudo /opt/backup/nextcloud-backup.sh -n
-
-# Real run (all options are passed on to backup.sh, e.g. -v or -c FILE)
-sudo /opt/backup/nextcloud-backup.sh
-```
-
-Example output of `--check`:
-
-```
-Nextcloud: /var/www/nextcloud (version 30.0.2.1, user www-data, PHP 8.3.6, database mysql)
-Nextcloud: Warning: /var/backups/nextcloud is not in SOURCES of /etc/backup/backup.conf – it will not be backed up.
-Nextcloud: maintenance mode is currently false; data directory /srv/nextcloud-data.
-Nextcloud: check only – a real run would enable maintenance mode, dump the database to /var/backups/nextcloud and run /opt/backup/backup.sh.
-```
-
-`SOURCES` in the backup configuration then needs at least:
-
-```bash
-SOURCES=(
-    "/var/www/nextcloud"        # installation incl. config/ and apps
-    "/srv/nextcloud-data"       # data directory (datadirectory in config.php)
-    "/var/backups/nextcloud"    # database dump
-)
-```
-
-**Mails:** `backup.sh` reports its own failures. The wrapper reports, to
-the same `MAIL_TO`, what happens around it:
-
-- `[backup] FAILED before the backup` – e.g. Nextcloud not found or the
-  dump failed; no backup was made,
-- `[backup] FAILED – Nextcloud still in maintenance mode` – ending the
-  maintenance mode failed,
-- `[backup] WARNING` – e.g. a Nextcloud folder is missing from `SOURCES`.
-
-If the detection picks the wrong thing, override it in
-`/etc/backup/nextcloud.conf` (next to the backup configuration, owned by
-root, sourced as Bash):
-
-```bash
-NEXTCLOUD_DIR="/var/www/nextcloud"
-NEXTCLOUD_PHP="/usr/bin/php8.3"
-NEXTCLOUD_DUMP=1                            # 0 = maintenance mode only
-NEXTCLOUD_DUMP_DIR="/var/backups/nextcloud"
-```
-
-For the daily run, put the wrapper into the systemd service instead of
-`backup.sh`: `ExecStart=/opt/backup/nextcloud-backup.sh`.
-
-Not supported: snap and Docker installations.
-
 ## Own steps before and after the backup
 
 Call `backup.sh` as usual. It automatically runs executable files from:
@@ -363,9 +274,7 @@ in the usual failure notification. The configuration lock covers both phases.
 Pre actions can create source directories before source existence is checked.
 
 Dry runs (`-n`), help, version, configuration generation, mail tests and
-`--restic` commands skip all actions. With `nextcloud-backup.sh`, actions run
-inside its maintenance window when it calls `backup.sh`; use them for
-additional tasks rather than duplicating its maintenance/database steps.
+`--restic` commands skip all actions.
 
 Git ignores user scripts in these directories; only the directory placeholders
 and README are tracked. Normal `git pull` updates leave your scripts intact.
@@ -376,7 +285,7 @@ from untrusted writers as well.
 
 Old `<config dir>/hooks/pre.d` and `post.d` are still ignored with a warning.
 Review and move their scripts into the new directories to enable them.
-Cron and systemd continue to call `backup.sh` (or the Nextcloud wrapper).
+Cron and systemd continue to call `backup.sh`.
 
 ## Mail notification
 
@@ -456,8 +365,6 @@ systemctl list-timers backup.timer
 journalctl -u backup.service
 ```
 
-With Nextcloud, use `ExecStart=/opt/backup/nextcloud-backup.sh` instead.
-
 `Persistent=true` catches up on a missed run, e.g. if the machine was off at
 night.
 
@@ -468,26 +375,20 @@ crontab format with a user column):
 
 `/etc/cron.d/backup`
 ```cron
-# Daily backup at 02:30; with Nextcloud use nextcloud-backup.sh instead
+# Daily backup at 02:30
 30 2 * * *  root  nice -n 10 ionice -c 3 /opt/backup/backup.sh >/dev/null 2>&1
-```
-
-```cron
-30 2 * * *  root  nice -n 10 ionice -c 3 /opt/backup/nextcloud-backup.sh >/dev/null 2>&1
 ```
 
 - Everything is logged to `LOG_FILE` and failures are mailed to `MAIL_TO`, so
   the output is discarded instead of being mailed by cron. If you have no
   `MAIL_TO`, redirect to a file (`>>/var/log/backup-cron.log 2>&1`) to keep
   errors that happen before the log file is opened.
-- Both scripts add `/usr/sbin` etc. to cron's minimal `PATH` themselves
-  (needed for `runuser` and `sendmail`).
+- The script adds `/usr/sbin` etc. to cron's minimal `PATH` itself
+  (needed for `sendmail` and custom actions).
 - Unlike `Persistent=true`, cron does not catch up on a run missed while the
   machine was off.
 - Files in `/etc/cron.d` must be owned by root, not group/other-writable,
   and their names must not contain dots.
-- Do not schedule `backup.sh` and `nextcloud-backup.sh` both – the wrapper
-  already runs the backup.
 
 ## Restoring
 
@@ -547,7 +448,7 @@ cd /mnt/restore && zcat /tmp/.backup-perms.facl.gz | sudo setfacl --restore=-
 ## Development checks
 
 ```bash
-bash -n backup.sh nextcloud-backup.sh
+bash -n backup.sh
 python3 -m unittest discover -s tests -v
 ```
 

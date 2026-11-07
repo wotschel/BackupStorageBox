@@ -142,13 +142,6 @@ WRAPPERS_DIR='{self.base / 'wrappers'}'
         self.assertIn('already running', result.stdout)
         self.assertFalse(self.calls.exists())
 
-    def test_nextcloud_rejects_broken_config(self):
-        self.config.write_text('false\n')
-        result = subprocess.run(['bash', str(ROOT / 'nextcloud-backup.sh'),
-                                 '-c', str(self.config), '--check'],
-                                capture_output=True, text=True)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('could not load configuration', result.stderr)
 
 
 if __name__ == '__main__':

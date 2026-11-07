@@ -7,7 +7,6 @@
 # per source, staggered retention via "restic forget --prune".
 #
 # Local actions in wrappers/pre and wrappers/post run around the backup.
-# Application-specific workflows can also use nextcloud-backup.sh.
 #
 # Mail (MAIL_TO): on failure, on warnings, and when the target has less than
 # MIN_FREE_PERCENT free space before the backup.
@@ -319,7 +318,7 @@ check_old_hooks() {
     dir="$(dirname -- "$CONFIG")/hooks"
     for f in "$dir"/pre.d/* "$dir"/post.d/*; do
         if [[ -f $f ]]; then
-            warn "Hooks are no longer supported since 5.0.0 – $dir is NOT run. Move executable actions to $WRAPPERS_DIR/pre and $WRAPPERS_DIR/post, or use nextcloud-backup.sh; then delete $dir."
+            warn "Hooks are no longer supported since 5.0.0 – $dir is NOT run. Move executable actions to $WRAPPERS_DIR/pre and $WRAPPERS_DIR/post; then delete $dir."
             return 0
         fi
     done
