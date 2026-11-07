@@ -191,13 +191,20 @@ SOURCES=(
     "/home"
     "/opt"
     "/root"
+    "/var"
 )
+# Note: live database files under /var/lib (mysql, postgresql) are not
+# consistent in a backup – dump them first in a
+# wrappers/pre/ action and back up the dump.
 
 # --- Excludes (restic patterns; a name without "/" matches anywhere) ---
 EXCLUDES=(
     ".cache"
     "*.tmp"
     "node_modules"
+    "/var/cache"
+    "/var/tmp"
+    "/var/lib/apt/lists"
 )
 
 # --- Retention ---

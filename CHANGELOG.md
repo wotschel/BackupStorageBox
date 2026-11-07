@@ -20,6 +20,8 @@ versioning according to [SemVer](https://semver.org/).
 ### Changed
 - Replace personal Storage Box account details and machine names in examples
   with explicit placeholders.
+- The sample configuration from `--init-config` also backs up `/var`
+  (excluding `/var/cache`, `/var/tmp` and `/var/lib/apt/lists`).
 - Default log path is `/var/log/backup/backup.log`; new files/directories use
   restrictive permissions. Existing configured paths remain supported.
 - Mail excerpts select the run ID instead of byte offsets in a shared log.
