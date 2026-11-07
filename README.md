@@ -178,7 +178,7 @@ owners and groups in the repository, so this does not apply there.
 ## Usage
 
 ```
-backup.sh [-c FILE] [-n] [-h] [-V] [--init-config [FILE]]
+backup.sh [-c FILE] [-n] [-v] [-h] [-V] [--init-config [FILE]]
 backup.sh --restore-perms FILE [TARGET_ROOT] [-n]
 backup.sh [-c FILE] --restic RESTIC-ARGS...
 ```
@@ -187,6 +187,7 @@ backup.sh [-c FILE] --restic RESTIC-ARGS...
 |---|---|
 | `-c FILE` | different configuration (alternatively `BACKUP_CONF=...`); default `/etc/backup/backup.conf` |
 | `-n` | dry run, nothing is changed |
+| `-v` / `--progress` | live progress display (terminal only, see below) |
 | `--init-config [FILE]` | write a sample configuration |
 | `--restore-perms FILE [TARGET_ROOT]` | rsync method: restore permissions, see below |
 | `--restic ARGS...` | run restic with the configured repository, password and SSH settings |
@@ -207,6 +208,25 @@ Each source is transferred separately, and the log shows the progress:
 
 If one source fails, the others still run. At the end the backup then counts
 as incomplete, and the failed sources are listed.
+
+### Progress display (`-v`)
+
+```bash
+sudo backup.sh -v
+```
+
+- **rsync:** an overall progress line per source (`--info=progress2`) with
+  bytes, percentage, speed and remaining files. The log only receives the
+  final state of that line, not every update. `--no-inc-recursive` is used so
+  the total is known from the start; for very large trees this needs some
+  more memory and a short scan before the transfer starts.
+- **restic:** restic's own progress bar (files, bytes, ETA). It is only drawn
+  when restic writes directly to the terminal, so with `-v` restic's normal
+  output (including its summary) goes to the terminal only; the script's own
+  log lines and restic's error messages are still logged.
+
+Without a terminal (systemd, cron, output redirected) `-v` is ignored with a
+note, so the journal stays clean.
 
 ## Running daily (systemd timer)
 

@@ -3,6 +3,16 @@
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 versioning according to [SemVer](https://semver.org/).
 
+## [3.3.0] – 2026-11-07
+
+### Added
+- `-v` / `--progress`: live progress display on the terminal
+  - rsync: overall progress per source (`--info=progress2 --no-inc-recursive`);
+    the log only keeps the final state of the progress line
+  - restic: restic's own progress bar; its output then goes to the terminal
+    only, the script's log lines and restic errors are still logged
+  - ignored with a note when not running on a terminal (systemd, cron)
+
 ## [3.2.0] – 2026-11-07
 
 ### Changed

@@ -13,7 +13,7 @@
 #
 set -euo pipefail
 
-readonly VERSION="3.2.0"
+readonly VERSION="3.3.0"
 # Kept outside the script directory, so the repository can be updated or
 # re-cloned at any time without touching the configuration.
 readonly DEFAULT_CONFIG="/etc/backup/backup.conf"
@@ -22,6 +22,7 @@ readonly PERMS_FILE=".backup-perms.facl.gz"
 
 CONFIG="${BACKUP_CONF:-$DEFAULT_CONFIG}"
 DRY_RUN=0
+PROGRESS=0
 INIT_CONFIG=0
 INIT_TARGET=""
 RESTORE_FILE=""
@@ -68,13 +69,15 @@ ensure_cmd() {
 
 usage() {
     cat <<EOF
-Usage: ${0##*/} [-c FILE] [-n] [-h] [-V] [--init-config [FILE]]
+Usage: ${0##*/} [-c FILE] [-n] [-v] [-h] [-V] [--init-config [FILE]]
        ${0##*/} --restore-perms FILE [TARGET_ROOT] [-n]
        ${0##*/} [-c FILE] --restic RESTIC-ARGS...
 
   -c FILE                configuration file (default: $DEFAULT_CONFIG,
                          alternatively via environment variable BACKUP_CONF)
   -n                     dry run (nothing is changed)
+  -v, --progress         show a live progress display (terminal only;
+                         the log gets the final state, not every update)
   --init-config [FILE]   write a sample configuration and exit
   --restore-perms FILE [TARGET_ROOT]
                          rsync method: restore owners, groups, permissions
@@ -173,6 +176,7 @@ while (( $# )); do
     case "$1" in
         -c) CONFIG="${2:?-c requires a file name}"; shift 2 ;;
         -n) DRY_RUN=1; shift ;;
+        -v|--progress) PROGRESS=1; shift ;;
         --init-config)
             INIT_CONFIG=1
             if [[ -n ${2:-} && $2 != -* ]]; then INIT_TARGET="$2"; shift; fi
@@ -347,8 +351,15 @@ backup_restic() {
         n=$((n + 1))
         log "[$n/${#SOURCES[@]}] Backing up $src ..."
         set +e
-        restic "${RESTIC_ARGS[@]}" "${args[@]}" "$src" 2>&1 | tee -a "$LOG_FILE"
-        rc=${PIPESTATUS[0]}
+        if (( PROGRESS )); then
+            # restic only draws its progress bar when stdout is a terminal,
+            # so stdout goes there directly; errors are still logged.
+            restic "${RESTIC_ARGS[@]}" "${args[@]}" "$src" 2> >(tee -a "$LOG_FILE" >&2)
+            rc=$?
+        else
+            restic "${RESTIC_ARGS[@]}" "${args[@]}" "$src" 2>&1 | tee -a "$LOG_FILE"
+            rc=${PIPESTATUS[0]}
+        fi
         set -e
         case $rc in
             0) log "[$n/${#SOURCES[@]}] $src done." ;;
@@ -460,7 +471,15 @@ backup_rsync() {
         n=$((n + 1))
         log "[$n/${#SOURCES[@]}] Backing up $src ..."
         set +e
-        rsync "${RSYNC_ARGS[@]}" "$src" "${REMOTE}:${DEST}/" 2>&1 | tee -a "$LOG_FILE"
+        if (( PROGRESS )); then
+            # Live progress on the terminal (fd 3); the log only keeps the
+            # last state of each \r-updated progress line.
+            rsync "${RSYNC_ARGS[@]}" --info=progress2 --no-inc-recursive \
+                "$src" "${REMOTE}:${DEST}/" 2>&1 \
+                | tee /dev/fd/3 | sed -u 's/.*\r//' >> "$LOG_FILE"
+        else
+            rsync "${RSYNC_ARGS[@]}" "$src" "${REMOTE}:${DEST}/" 2>&1 | tee -a "$LOG_FILE"
+        fi
         rc=${PIPESTATUS[0]}
         set -e
         case $rc in
@@ -523,6 +542,13 @@ if (( RESTIC_PASSTHRU )); then
 fi
 
 [[ $BACKUP_METHOD == restic ]] && restic_setup
+
+# Progress display only makes sense on a terminal (not under systemd/cron)
+if (( PROGRESS )) && [[ ! -t 1 ]]; then
+    log "Note: -v needs a terminal – progress display disabled."
+    PROGRESS=0
+fi
+exec 3>&1   # console, used by the progress display
 
 # Only one instance at a time
 exec 9>"/tmp/backup-${BACKUP_NAME}.lock"

@@ -54,6 +54,11 @@ Requirements:
   `--keep-within <KEEP_DAYS>d`); treat restic code 3 as a warning; `--restic ARGS...`
   passes arguments to restic with the configured settings (for restore etc.);
   install `restic` like the other dependencies.
+- Option `-v` / `--progress` for a live progress display, only on a terminal
+  (otherwise ignored with a note): rsync with `--info=progress2
+  --no-inc-recursive`, only the final state of the progress line goes to the
+  log; restic writes stdout directly to the terminal so it draws its own
+  progress bar, errors are still logged.
 - All output, comments and documentation in English.
 
 Also provide README.md (how it works, setup, configuration, systemd timer,
