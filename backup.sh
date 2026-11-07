@@ -1,15 +1,10 @@
 #!/usr/bin/env bash
 #
-# backup.sh – Daily backup to a remote server via rsync or restic.
+# backup.sh – Daily backup with restic to a remote server via SFTP.
 #
-# BACKUP_METHOD="rsync" (default):
-#   Each day goes to <REMOTE_BASE>/<BACKUP_NAME>/<YYYY-MM-DD>. Unchanged files
-#   are hard-linked to the last complete backup via --link-dest and take up no
-#   additional space. Every daily folder is still a complete snapshot.
-#
-# BACKUP_METHOD="restic":
-#   Encrypted, deduplicated snapshots in a restic repository reached via SFTP
-#   (default <REMOTE_BASE>/restic-<BACKUP_NAME>).
+# Encrypted, deduplicated, compressed snapshots in a restic repository
+# (default restic-<BACKUP_NAME> in the home of the SSH user), one snapshot
+# per source, staggered retention via "restic forget --prune".
 #
 # Hooks: executable files in <HOOKS_DIR>/pre.d run before the backup (e.g.
 # database dumps, maintenance mode on), those in <HOOKS_DIR>/post.d afterwards
@@ -20,24 +15,19 @@
 #
 set -euo pipefail
 
-readonly VERSION="3.6.1"
+readonly VERSION="4.0.0"
 # Kept outside the script directory, so the repository can be updated or
 # re-cloned at any time without touching the configuration.
 readonly DEFAULT_CONFIG="/etc/backup/backup.conf"
-readonly MARKER=".backup-complete"
-readonly PERMS_FILE=".backup-perms.facl.gz"
 
 CONFIG="${BACKUP_CONF:-$DEFAULT_CONFIG}"
 DRY_RUN=0
 PROGRESS=0
 INIT_CONFIG=0
 INIT_TARGET=""
-RESTORE_FILE=""
-RESTORE_ROOT="/"
 RESTIC_PASSTHRU=0
 RESTIC_PASSTHRU_ARGS=()
 LOG_FILE="/dev/null"
-STAGE=""
 POST_HOOKS_PENDING=0
 TEST_MAIL=0
 LAST_ERROR=""
@@ -87,7 +77,6 @@ usage() {
     cat <<EOF
 Usage: ${0##*/} [-c FILE] [-n] [-v] [-h] [-V] [--init-config [FILE]]
        ${0##*/} [-c FILE] --test-mail
-       ${0##*/} --restore-perms FILE [TARGET_ROOT] [-n]
        ${0##*/} [-c FILE] --restic RESTIC-ARGS...
 
   -c FILE                configuration file (default: $DEFAULT_CONFIG,
@@ -97,10 +86,6 @@ Usage: ${0##*/} [-c FILE] [-n] [-v] [-h] [-V] [--init-config [FILE]]
                          the log gets the final state, not every update)
   --init-config [FILE]   write a sample configuration and exit
   --test-mail            send a test mail to MAIL_TO and exit
-  --restore-perms FILE [TARGET_ROOT]
-                         rsync method: restore owners, groups, permissions
-                         and ACLs from a saved $PERMS_FILE
-                         (TARGET_ROOT default: /, with -n only check)
   --restic ARGS...       run restic with the configured repository, password
                          and SSH settings, e.g. "--restic snapshots"
                          (all following arguments are passed to restic)
@@ -113,22 +98,25 @@ config_template() {
     cat <<'EOF'
 # backup.conf – configuration for backup.sh (sourced as Bash)
 
-# --- Backup method: "rsync" or "restic" ---
-# rsync:  plain daily folders with hard links, readable without extra tools
-# restic: encrypted, deduplicated, compressed snapshots (needs restic to restore)
-BACKUP_METHOD="rsync"
-
 # --- Target server: Hetzner Storage Box ---
 REMOTE_USER="u712238"           # Storage Box user
 REMOTE_HOST="${REMOTE_USER}.your-storagebox.de"
-SSH_PORT=23                     # Storage Box SSH/rsync/SFTP port
+SSH_PORT=23                     # Storage Box SSH/SFTP port
 SSH_KEY="/root/.ssh/backup_ed25519"   # empty = ssh default key (path without spaces)
 
-# --- Target path ---
-# rsync:  <REMOTE_BASE>/<BACKUP_NAME>/<YYYY-MM-DD>
-# restic: RESTIC_REPO_PATH (see below)
-REMOTE_BASE="."                 # relative to the Storage Box home
+# --- Name of this machine (restic host name of its snapshots) ---
 BACKUP_NAME="$(hostname -s)"
+
+# --- restic repository ---
+# Path on the target, relative = relative to the Storage Box home. One
+# repository per machine by default; several machines may share one
+# repository (same password) to deduplicate across them.
+RESTIC_REPO_PATH="restic-${BACKUP_NAME}"
+
+# Repository password. WITHOUT IT THE BACKUPS ARE LOST – keep a copy elsewhere.
+# Create it with:
+#   sudo sh -c 'umask 077; head -c 32 /dev/urandom | base64 > /etc/backup/restic.pass'
+RESTIC_PASSWORD_FILE="/etc/backup/restic.pass"
 
 # --- Directories to back up (absolute paths) ---
 SOURCES=(
@@ -138,17 +126,18 @@ SOURCES=(
     "/root"
 )
 
-# --- Excludes (rsync patterns; for restic a trailing "/" is dropped) ---
+# --- Excludes (restic patterns; a name without "/" matches anywhere) ---
 EXCLUDES=(
-    ".cache/"
+    ".cache"
     "*.tmp"
-    "node_modules/"
+    "node_modules"
 )
 
-# --- Retention in days for rsync (0 = never delete) ---
-# restic uses RESTIC_FORGET_OPTS below; KEEP_DAYS only applies there if
-# RESTIC_FORGET_OPTS is empty (as "forget --keep-within <KEEP_DAYS>d")
-KEEP_DAYS=30
+# --- Retention ---
+# Staggered: last 7 days daily, last 5 weeks weekly, last 12 months monthly
+# (about one year of history). Any "restic forget" policy works, e.g.
+# (--keep-within 30d). Empty () = never delete.
+RESTIC_FORGET_OPTS=(--keep-daily 7 --keep-weekly 5 --keep-monthly 12)
 
 # --- Log file ---
 LOG_FILE="/var/log/backup.log"
@@ -172,39 +161,6 @@ MAIL_TO=""                      # empty = no mails
 MAIL_FROM=""                    # empty = default of the mail system
 MIN_FREE_PERCENT=5              # 0 = do not check
 
-# =============================================================================
-# rsync only
-# =============================================================================
-
-# Without -A/-X: the Storage Box is not written to as root, so ACLs and
-# extended attributes cannot be stored there (SAVE_PERMS covers this).
-# For a target with root access: RSYNC_OPTS=(-aHAX --numeric-ids --delete --delete-excluded)
-RSYNC_OPTS=(-aH --numeric-ids --delete --delete-excluded)
-
-# Additionally save permissions with getfacl (1 = yes, 0 = no).
-# Important if the target cannot store owners/groups (e.g. Storage Box).
-# Requires the "acl" package – if missing, the script installs it (as root)
-# or aborts. Restore with: backup.sh --restore-perms FILE
-SAVE_PERMS=1
-
-# =============================================================================
-# restic only
-# =============================================================================
-
-# Repository path on the target (relative = relative to the Storage Box home).
-# One repository per machine by default; several machines may share one
-# repository (same password) to deduplicate across them.
-RESTIC_REPO_PATH="${REMOTE_BASE%/}/restic-${BACKUP_NAME}"
-
-# Repository password. WITHOUT IT THE BACKUPS ARE LOST – keep a copy elsewhere.
-# Create it with:
-#   sudo sh -c 'umask 077; head -c 32 /dev/urandom | base64 > /etc/backup/restic.pass'
-RESTIC_PASSWORD_FILE="/etc/backup/restic.pass"
-
-# Staggered retention: last 7 days daily, last 5 weeks weekly, last 12 months
-# monthly (about one year of history). Empty () = use KEEP_DAYS instead;
-# empty and KEEP_DAYS=0 = never delete.
-RESTIC_FORGET_OPTS=(--keep-daily 7 --keep-weekly 5 --keep-monthly 12)
 EOF
 }
 
@@ -284,8 +240,7 @@ notify() {
         echo "Backup $BACKUP_NAME on $(hostname -f 2>/dev/null || hostname): $status (exit code $rc)"
         echo
         echo "Configuration: $CONFIG"
-        echo "Method:        $BACKUP_METHOD"
-        echo "Target:        ${REMOTE_USER}@${REMOTE_HOST}"
+        echo "Repository:    ${RESTIC_REPOSITORY:-?}"
         echo "Duration:      ${SECONDS}s"
         [[ -n $LAST_ERROR ]] && printf '\nError:\n  %s\n' "$LAST_ERROR"
         if (( ${#WARNINGS[@]} > 0 )); then
@@ -325,7 +280,7 @@ run_hooks() {
     done
     (( ${#hooks[@]} > 0 )) || return 0
 
-    export BACKUP_PHASE="$phase" BACKUP_NAME BACKUP_METHOD
+    export BACKUP_PHASE="$phase" BACKUP_NAME
     export BACKUP_CONFIG="$CONFIG" BACKUP_LOG_FILE="$LOG_FILE"
 
     for hook in "${hooks[@]}"; do
@@ -380,7 +335,7 @@ ensure_hook_dirs() {
 }
 
 # EXIT trap: runs the post hooks (if the pre phase was reached), sends the
-# notification mail and cleans up. A failing post hook turns a successful run
+# notification mail. A failing post hook turns a successful run
 # into exit code 1.
 on_exit() {
     local rc=$?
@@ -398,7 +353,6 @@ on_exit() {
         set +e   # run_hooks switches errexit back on
     fi
     notify "$rc"
-    [[ -n $STAGE ]] && rm -rf "$STAGE"
     exit "$rc"
 }
 
@@ -415,8 +369,9 @@ while (( $# )); do
             if [[ -n ${2:-} && $2 != -* ]]; then INIT_TARGET="$2"; shift; fi
             shift ;;
         --restore-perms)
-            RESTORE_FILE="${2:?--restore-perms requires a file}"; shift 2
-            if [[ -n ${1:-} && $1 != -* ]]; then RESTORE_ROOT="$1"; shift; fi ;;
+            echo "Error: --restore-perms was removed together with the rsync method in 4.0.0." >&2
+            echo "Restore a saved .backup-perms.facl.gz with: cd TARGET_ROOT && zcat FILE | sudo setfacl --restore=-" >&2
+            exit 2 ;;
         --restic)
             RESTIC_PASSTHRU=1; shift
             RESTIC_PASSTHRU_ARGS=("$@")
@@ -451,47 +406,14 @@ if (( INIT_CONFIG )); then
     exit 0
 fi
 
-# --- Restore permissions (rsync method) --------------------------------------
-
-if [[ -n $RESTORE_FILE ]]; then
-    ensure_cmd setfacl acl
-    [[ -r $RESTORE_FILE ]] || { echo "Error: $RESTORE_FILE is not readable." >&2; exit 1; }
-    [[ -d $RESTORE_ROOT ]] || { echo "Error: target root $RESTORE_ROOT does not exist." >&2; exit 1; }
-    RESTORE_FILE="$(realpath -- "$RESTORE_FILE")"
-    (( EUID == 0 )) || echo "Warning: owners and groups cannot be set without root." >&2
-    cd "$RESTORE_ROOT"
-    if (( DRY_RUN )); then
-        echo "Dry run: showing what would be set under $RESTORE_ROOT (first 50 lines) ..."
-        zcat -f -- "$RESTORE_FILE" | setfacl --test --restore=- 2>/dev/null | head -n 50 || true
-        exit 0
-    fi
-    echo "Restoring permissions from $RESTORE_FILE under $RESTORE_ROOT ..."
-    errfile="$(mktemp)"
-    zcat -f -- "$RESTORE_FILE" | setfacl --restore=- 2>"$errfile" || true
-    # Missing files are normal (excludes, files deleted since the backup)
-    missing=$(grep -c 'No such file or directory' "$errfile" || true)
-    grep -v 'No such file or directory' "$errfile" > "$errfile.real" || true
-    (( missing > 0 )) && echo "Note: skipped $missing entries because the file is missing in the target (e.g. excludes)."
-    if [[ -s $errfile.real ]]; then
-        echo "Errors while setting permissions:" >&2
-        head -n 20 "$errfile.real" >&2
-        rm -f "$errfile" "$errfile.real"
-        exit 1
-    fi
-    rm -f "$errfile" "$errfile.real"
-    echo "Done."
-    exit 0
-fi
-
 # --- Load configuration ------------------------------------------------------
 
 [[ -r $CONFIG ]] || die "Configuration not readable: $CONFIG (create it with --init-config)"
 
-BACKUP_METHOD="rsync"
+BACKUP_METHOD="restic"   # only for old configurations, see below
 REMOTE_USER=""; REMOTE_HOST=""; SSH_PORT=22; SSH_KEY=""
-REMOTE_BASE="/home"; BACKUP_NAME="$(hostname -s)"
-SOURCES=(); EXCLUDES=(); KEEP_DAYS=30; SAVE_PERMS=1
-RSYNC_OPTS=(-aHAX --numeric-ids --delete --delete-excluded)
+REMOTE_BASE=""; BACKUP_NAME="$(hostname -s)"
+SOURCES=(); EXCLUDES=()
 RESTIC_REPO_PATH=""
 RESTIC_PASSWORD_FILE="/etc/backup/restic.pass"
 RESTIC_FORGET_OPTS=(--keep-daily 7 --keep-weekly 5 --keep-monthly 12)
@@ -516,13 +438,12 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-[[ $BACKUP_METHOD == rsync || $BACKUP_METHOD == restic ]] \
-                               || die "BACKUP_METHOD must be \"rsync\" or \"restic\" (is \"$BACKUP_METHOD\")"
+[[ $BACKUP_METHOD == restic ]] || die "BACKUP_METHOD=\"$BACKUP_METHOD\" is no longer supported – since 4.0.0 \
+only restic is available. Remove BACKUP_METHOD from $CONFIG and set up restic (see README)."
 [[ -n $REMOTE_USER ]]          || die "REMOTE_USER is missing in $CONFIG"
 [[ -n $REMOTE_HOST ]]          || die "REMOTE_HOST is missing in $CONFIG"
 [[ -n $BACKUP_NAME ]]          || die "BACKUP_NAME is missing in $CONFIG"
 (( ${#SOURCES[@]} > 0 ))       || die "SOURCES is empty"
-[[ $KEEP_DAYS =~ ^[0-9]+$ ]]   || die "KEEP_DAYS must be an integer"
 [[ $HOOK_TIMEOUT =~ ^[0-9]+$ ]] || die "HOOK_TIMEOUT must be an integer"
 [[ $MIN_FREE_PERCENT =~ ^[0-9]+$ ]] && (( MIN_FREE_PERCENT <= 100 )) \
                                || die "MIN_FREE_PERCENT must be an integer from 0 to 100"
@@ -533,7 +454,7 @@ done
 
 # --- SSH basics --------------------------------------------------------------
 #
-# NO shell commands are run on the target – only rsync or SFTP.
+# NO shell commands are run on the target – only SFTP.
 # This makes restricted targets like the Hetzner Storage Box work as well.
 
 REMOTE="${REMOTE_USER}@${REMOTE_HOST}"
@@ -548,7 +469,8 @@ TODAY="$(date +%F)"
 
 restic_setup() {
     ensure_cmd restic restic
-    [[ -n $RESTIC_REPO_PATH ]] || RESTIC_REPO_PATH="${REMOTE_BASE%/}/restic-${BACKUP_NAME}"
+    # REMOTE_BASE is only still honoured for configurations from before 4.0.0
+    [[ -n $RESTIC_REPO_PATH ]] || RESTIC_REPO_PATH="${REMOTE_BASE:+${REMOTE_BASE%/}/}restic-${BACKUP_NAME}"
     [[ -r $RESTIC_PASSWORD_FILE ]] || die "restic password file not readable: $RESTIC_PASSWORD_FILE
   Create it (and keep a copy elsewhere – without it the backups are lost):
   sudo sh -c 'umask 077; head -c 32 /dev/urandom | base64 > $RESTIC_PASSWORD_FILE'"
@@ -572,7 +494,7 @@ restic_repo_exists() {
 
 backup_restic() {
     local rc
-    log "=== Backup $BACKUP_NAME -> $RESTIC_REPOSITORY (restic, v$VERSION) ==="
+    log "=== Backup $BACKUP_NAME -> $RESTIC_REPOSITORY (v$VERSION) ==="
     (( DRY_RUN )) && log "DRY RUN – nothing will be changed."
 
     if ! restic_repo_exists; then
@@ -625,15 +547,9 @@ backup_restic() {
         || die "Backup $TODAY is INCOMPLETE – failed: ${failed[*]}"
 
     # Retention: only snapshots of this host; prune removes unreferenced data
-    local -a forget=()
     if (( ${#RESTIC_FORGET_OPTS[@]} > 0 )); then
-        forget=("${RESTIC_FORGET_OPTS[@]}")
-    elif (( KEEP_DAYS > 0 )); then
-        forget=(--keep-within "${KEEP_DAYS}d")
-    fi
-    if (( ${#forget[@]} > 0 )); then
-        log "Removing old snapshots (${forget[*]}) ..."
-        local -a fargs=(forget --host "$BACKUP_NAME" --prune "${forget[@]}")
+        log "Removing old snapshots (${RESTIC_FORGET_OPTS[*]}) ..."
+        local -a fargs=(forget --host "$BACKUP_NAME" --prune "${RESTIC_FORGET_OPTS[@]}")
         (( DRY_RUN )) && fargs+=(--dry-run)
         set +e
         restic "${RESTIC_ARGS[@]}" "${fargs[@]}" 2>&1 | tee -a "$LOG_FILE"
@@ -649,140 +565,6 @@ backup_restic() {
         log "=== Done after ${SECONDS}s ==="
     fi
 }
-
-# =============================================================================
-# rsync
-# =============================================================================
-
-backup_rsync() {
-    ensure_cmd rsync rsync
-    (( SAVE_PERMS )) && ensure_cmd getfacl acl
-
-    DEST_ROOT="${REMOTE_BASE%/}/${BACKUP_NAME}"
-    DEST="${DEST_ROOT}/${TODAY}"
-    local DATE_PAT='[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
-
-    STAGE="$(mktemp -d)"   # removed by on_exit
-    mkdir -p "$STAGE/empty"
-
-    log "=== Backup $BACKUP_NAME -> $REMOTE:$DEST (rsync, v$VERSION) ==="
-    (( DRY_RUN )) && log "DRY RUN – nothing will be changed."
-
-    # Create the target folder (rsync creates the last level itself)
-    rs -r "$STAGE/empty/" "${REMOTE}:${DEST_ROOT}/" \
-        || die "Target server unreachable or ${DEST_ROOT} cannot be created."
-
-    # List existing backups: daily folders and their completion markers
-    LISTING="$(rs -r --list-only \
-        --include="/${DATE_PAT}/" --include="/${DATE_PAT}/${MARKER}" --exclude='*' \
-        "${REMOTE}:${DEST_ROOT}/" | awk '{print $NF}')" \
-        || die "Could not list existing backups."
-
-    # Last complete backup (before today) as hard-link base
-    PREV="$(grep -E "^[0-9]{4}-[0-9]{2}-[0-9]{2}/${MARKER//./\\.}\$" <<<"$LISTING" \
-            | cut -d/ -f1 | grep -vx "$TODAY" | sort | tail -n 1 || true)"
-
-    if [[ -n $PREV ]]; then
-        log "Hard-link base: $PREV"
-    else
-        log "No previous backup found – creating a full backup."
-    fi
-
-    RSYNC_ARGS=("${RSYNC_OPTS[@]}" --relative --partial --stats -e "$RSH")
-    # Relative to the daily folder – works regardless of the target's path layout
-    [[ -n $PREV ]] && RSYNC_ARGS+=("--link-dest=../${PREV}")
-    local ex
-    for ex in "${EXCLUDES[@]}"; do RSYNC_ARGS+=("--exclude=$ex"); done
-    (( DRY_RUN )) && RSYNC_ARGS+=(--dry-run)
-
-    # On a second run the same day: remove the marker until rsync has finished
-    if (( ! DRY_RUN )) && grep -qx "${TODAY}/${MARKER}" <<<"$LISTING"; then
-        rs -r --delete --include="/${MARKER}" --exclude='*' "$STAGE/empty/" "${REMOTE}:${DEST}/" \
-            || die "Could not remove the old marker in $TODAY."
-    fi
-
-    # Record permissions and owners of all sources (before copying = state of the backup)
-    local src
-    mkdir -p "$STAGE/mark/$TODAY"
-    if (( SAVE_PERMS )) && (( ! DRY_RUN )); then
-        : > "$STAGE/perms.facl"
-        for src in "${SOURCES[@]}"; do
-            log "Recording permissions: $src"
-            # without leading "/" -> relative, can be restored into any target root
-            (cd / && getfacl -R -P -- "${src#/}" >> "$STAGE/perms.facl" 2>/dev/null) || true
-        done
-        gzip -c "$STAGE/perms.facl" > "$STAGE/mark/$TODAY/$PERMS_FILE"
-        rm -f "$STAGE/perms.facl"
-        log "Permissions recorded ($(du -h "$STAGE/mark/$TODAY/$PERMS_FILE" | cut -f1) compressed)."
-    fi
-
-    local -a failed=()
-    local n=0 rc
-    for src in "${SOURCES[@]}"; do
-        n=$((n + 1))
-        log "[$n/${#SOURCES[@]}] Backing up $src ..."
-        set +e
-        if (( PROGRESS )); then
-            # Live progress on the terminal (fd 3); the log only keeps the
-            # last state of each \r-updated progress line.
-            rsync "${RSYNC_ARGS[@]}" --info=progress2 --no-inc-recursive \
-                "$src" "${REMOTE}:${DEST}/" 2>&1 \
-                | tee /dev/fd/3 | sed -u 's/.*\r//' >> "$LOG_FILE"
-        else
-            rsync "${RSYNC_ARGS[@]}" "$src" "${REMOTE}:${DEST}/" 2>&1 | tee -a "$LOG_FILE"
-        fi
-        rc=${PIPESTATUS[0]}
-        set -e
-        case $rc in
-            0)  log "[$n/${#SOURCES[@]}] $src done." ;;
-            24) log "[$n/${#SOURCES[@]}] $src done – some files vanished during transfer (rsync 24)." ;;
-            *)  log "[$n/${#SOURCES[@]}] ERROR for $src (rsync exit code $rc)."
-                failed+=("$src") ;;
-        esac
-    done
-
-    (( ${#failed[@]} == 0 )) \
-        || die "Backup $TODAY is INCOMPLETE – failed: ${failed[*]}"
-
-    if (( DRY_RUN )); then
-        log "Dry run finished (${SECONDS}s)."
-        return 0
-    fi
-
-    # Finish: set marker, update "latest"
-    : > "$STAGE/mark/$TODAY/$MARKER"
-    rs -r "$STAGE/mark/" "${REMOTE}:${DEST_ROOT}/" \
-        || die "Could not set the completion marker."
-    log "Backup $TODAY complete."
-
-    mkdir -p "$STAGE/link"
-    ln -s "$TODAY" "$STAGE/link/latest"
-    rs -rl "$STAGE/link/" "${REMOTE}:${DEST_ROOT}/" \
-        || log "Warning: could not set symlink 'latest' (not supported by the target?)."
-
-    # Remove old backups: sync an empty directory with --delete and a filter
-    # matching the old daily folders – rsync deletes exactly these, nothing else.
-    if (( KEEP_DAYS > 0 )); then
-        local cutoff d
-        cutoff="$(date -d "-${KEEP_DAYS} days" +%F)"
-        local -a old=() filter=()
-        mapfile -t old < <(grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' <<<"$LISTING" \
-                           | awk -v c="$cutoff" '$0 < c')
-        if (( ${#old[@]} > 0 )); then
-            for d in "${old[@]}"; do
-                log "Removing old backup: $d"
-                filter+=("--include=/${d}/***")
-            done
-            rs -r --delete "${filter[@]}" --exclude='*' "$STAGE/empty/" "${REMOTE}:${DEST_ROOT}/" \
-                || warn "Old backups could not be removed completely."
-        fi
-    fi
-
-    log "=== Done after ${SECONDS}s ==="
-}
-
-# rsync without data transfer, only for housekeeping steps
-rs() { rsync -e "$RSH" "$@"; }
 
 # --- Main --------------------------------------------------------------------
 
@@ -800,14 +582,13 @@ if (( TEST_MAIL )); then
     exit 0
 fi
 
-[[ $BACKUP_METHOD == restic ]] && restic_setup
+restic_setup
 
 # Progress display only makes sense on a terminal (not under systemd/cron)
 if (( PROGRESS )) && [[ ! -t 1 ]]; then
     log "Note: -v needs a terminal – progress display disabled."
     PROGRESS=0
 fi
-exec 3>&1   # console, used by the progress display
 
 # Only one instance per configuration at a time. The lock is held on the
 # configuration file itself (opened read-only), so no lock file is needed –
@@ -822,7 +603,4 @@ POST_HOOKS_PENDING=1
 ensure_hook_dirs
 run_hooks pre || die "A pre-backup hook failed – backup aborted (post-backup hooks still run)."
 
-case $BACKUP_METHOD in
-    rsync)  backup_rsync ;;
-    restic) backup_restic ;;
-esac
+backup_restic

@@ -3,6 +3,33 @@
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 versioning according to [SemVer](https://semver.org/).
 
+## [4.0.0] – 2026-11-07
+
+### Removed
+- **The rsync method.** restic is the only backup method now; the script
+  shrinks from 828 to about 600 lines. Removed with it: `BACKUP_METHOD`,
+  `KEEP_DAYS`, `RSYNC_OPTS`, `SAVE_PERMS`, `--restore-perms`, the
+  permissions file and the `rsync`/`acl` dependencies
+- `KEEP_DAYS` as fallback retention for restic: `RESTIC_FORGET_OPTS=()` now
+  means "never delete"; for a fixed number of days use
+  `RESTIC_FORGET_OPTS=(--keep-within 30d)`
+- `BACKUP_METHOD` in the hook environment and the "Method" line in mails
+  (replaced by "Repository")
+
+### Changed
+- Default `RESTIC_REPO_PATH` is `restic-<BACKUP_NAME>` in the SSH user's
+  home; `REMOTE_BASE` is no longer in the sample configuration but still
+  honoured if set
+- Sample configuration: restic settings first, excludes written as restic
+  patterns (`.cache` instead of `.cache/`)
+
+### Migration
+- A configuration with `BACKUP_METHOD="rsync"` makes the script abort with
+  a hint; `BACKUP_METHOD="restic"` is still accepted. Other old settings
+  are ignored
+- Existing rsync daily folders on the target are left untouched; delete
+  them yourself when no longer needed (see README, "Migrating from rsync")
+
 ## [3.6.1] – 2026-11-07
 
 ### Changed

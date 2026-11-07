@@ -1,54 +1,36 @@
 # backup.sh
 
-Daily backup of selected directories over SSH to a remote server, with one of
-two methods selected in the configuration (`BACKUP_METHOD`):
+Daily backup of selected directories with [restic](https://restic.net/)
+over SFTP to a remote server, preset for the Hetzner Storage Box:
 
-| | `rsync` (default) | `restic` |
-|---|---|---|
-| Storage | one plain folder per day, unchanged files hard-linked | encrypted repository with snapshots |
-| Restore | any tool (rsync, SFTP client, Hetzner web UI) | needs `restic` (`backup.sh --restic ...`) |
-| Encryption | none | yes, client-side (password file) |
-| Deduplication | whole unchanged files only | blocks, across files and renames |
-| Compression | no | yes |
-| Owners/groups on the Storage Box | via `getfacl` file, restored with `--restore-perms` | stored in the repository |
-| Retention | `KEEP_DAYS` (30 days) | staggered: 7 daily, 5 weekly, 12 monthly (`RESTIC_FORGET_OPTS`) |
+- **encrypted** on the client (repository password), **deduplicated** in
+  blocks across files and renames, **compressed**
+- one snapshot per source, owners, groups, permissions, ACLs and extended
+  attributes included
+- **staggered retention**: 7 daily, 5 weekly, 12 monthly snapshots
+- **hooks** before and after the backup (e.g. database dump, Nextcloud
+  maintenance mode), ready-made hooks for Nextcloud included
+- **mail** on failure, on warnings and when the target runs out of space
 
-Both methods run **no shell commands** on the target – only rsync or SFTP – so
+The script runs **no shell commands** on the target – only SFTP – so
 restricted targets like the Hetzner Storage Box work.
 
-## Method rsync
-
-### Layout on the target server
-
-```
-<REMOTE_BASE>/<BACKUP_NAME>/
-├── 2026-11-05/          complete snapshot of Nov 5
-├── 2026-11-06/          complete snapshot of Nov 6 (hard links to Nov 5)
-├── 2026-11-07/
-│   ├── .backup-complete         completion marker
-│   ├── .backup-perms.facl.gz    owners, permissions, ACLs (getfacl)
-│   ├── etc/ ...
-└── latest -> 2026-11-07
-```
-
-Source paths are preserved (`/etc` ends up in `2026-11-07/etc`). Every daily
-folder is a complete snapshot but only takes up the space of the changed files.
-
-A day only counts as finished once rsync has succeeded; then the file
-`.backup-complete` is created. Only such folders serve as hard-link base, so an
-aborted run does not corrupt the next one. If a day is missing, the script
-automatically links against the last complete backup. Listing, marking,
-setting `latest` and cleanup are done exclusively through rsync.
-
-## Method restic
+## How it works
 
 The repository is reached via SFTP at `RESTIC_REPO_PATH` (default
-`<REMOTE_BASE>/restic-<BACKUP_NAME>`, i.e. `restic-sv32` in the box's home).
-The first run initializes it automatically. Each source becomes its own
-snapshot (host = `BACKUP_NAME`), so the log shows progress per source and a
-failing source does not affect the others. Afterwards
-`restic forget --prune` removes old snapshots of this host according to the
-staggered retention (see "Configuration").
+`restic-<BACKUP_NAME>` in the home of the SSH user). The first run
+initializes it automatically. Each source becomes its own snapshot
+(host = `BACKUP_NAME`), so the log shows progress per source and a failing
+source does not affect the others. Afterwards `restic forget --prune`
+removes old snapshots of this host according to the retention policy.
+
+A run consists of:
+
+1. check the free space on the target (`MIN_FREE_PERCENT`),
+2. pre hooks (`pre.d/`),
+3. restic backup per source, then `forget --prune`,
+4. post hooks (`post.d/`) – always, also after errors,
+5. mail if something failed or there were warnings.
 
 The repository password is read from `RESTIC_PASSWORD_FILE` (default
 `/etc/backup/restic.pass`). **Without this password all backups are lost** –
@@ -58,12 +40,11 @@ keep a copy outside the server, e.g. in a password manager.
 
 - Ubuntu 26.04 LTS or newer
 - SSH access by key without password prompt (`BatchMode=yes`)
-- On the target, rsync or SFTP is enough; no shell is needed
-- Packages, depending on the method: `rsync` and `acl` (`getfacl`/`setfacl`),
-  or `restic`. If they are missing, the script installs them itself via
-  `apt-get` when running as root. Without root or during a dry run it aborts
-  with a hint instead, before anything is transferred.
-- rsync method: target file system that supports hard links (the Storage Box does)
+- SFTP on the target; no shell is needed
+- `restic`: if it is missing, the script installs it via `apt-get` when
+  running as root. Without root or during a dry run it aborts with a hint
+  instead, before anything is transferred.
+- for mails: a working `sendmail`, see "Mail notification"
 
 ## Setup
 
@@ -83,12 +64,12 @@ sudo ln -s /opt/backup/backup.sh /usr/local/sbin/backup.sh
 
 # 3. Create the sample configuration and adjust it
 sudo backup.sh --init-config          # -> /etc/backup/backup.conf
-sudo nano /etc/backup/backup.conf       # BACKUP_METHOD, SOURCES, EXCLUDES, KEEP_DAYS
+sudo nano /etc/backup/backup.conf       # REMOTE_USER, SOURCES, EXCLUDES, MAIL_TO
 
-# 3a. Only for restic: create the repository password – and store a copy safely!
+# 4. Create the repository password – and store a copy safely!
 sudo sh -c 'umask 077; head -c 32 /dev/urandom | base64 > /etc/backup/restic.pass'
 
-# 4. Dry run, then a real run
+# 5. Dry run, then a real run
 sudo backup.sh -n
 sudo backup.sh
 ```
@@ -107,37 +88,27 @@ for the Storage Box (see below).
 
 | Variable      | Meaning                                           | Default |
 |---------------|---------------------------------------------------|---------|
-| `BACKUP_METHOD` | `rsync` or `restic`                             | `rsync` |
 | `REMOTE_USER` | User on the target server                         | –       |
 | `REMOTE_HOST` | Target server                                     | –       |
 | `SSH_PORT`    | SSH port                                          | `22`    |
 | `SSH_KEY`     | Path to the private key (without spaces)          | empty   |
-| `REMOTE_BASE` | Base directory on the target server               | `/home` |
-| `BACKUP_NAME` | Folder (rsync) or restic host name per machine    | `hostname -s` |
+| `BACKUP_NAME` | restic host name of this machine's snapshots      | `hostname -s` |
+| `RESTIC_REPO_PATH` | Repository path on the target (relative = home) | `restic-<BACKUP_NAME>` |
+| `RESTIC_PASSWORD_FILE` | File containing the repository password  | `/etc/backup/restic.pass` |
 | `SOURCES`     | Array of directories to back up (absolute)        | –       |
-| `EXCLUDES`    | Array of exclude patterns                         | empty   |
-| `KEEP_DAYS`   | rsync retention in days, `0` = never delete       | `30`    |
+| `EXCLUDES`    | Array of restic exclude patterns                  | empty   |
+| `RESTIC_FORGET_OPTS` | Array of `restic forget` policies, `()` = never delete | `--keep-daily 7 --keep-weekly 5 --keep-monthly 12` |
 | `LOG_FILE`    | Log file                                          | `/var/log/backup.log` |
 | `HOOKS_DIR`   | Folder with `pre.d/` and `post.d/`, see "Hooks"   | `hooks` next to the configuration |
 | `HOOK_TIMEOUT` | Time limit per hook in seconds, `0` = none       | `3600`  |
 | `MAIL_TO`     | Mail recipients (comma-separated), see "Mail"     | empty = no mails |
 | `MAIL_FROM`   | Sender address                                    | empty = mail system default |
 | `MIN_FREE_PERCENT` | Warn below this free space on the target, `0` = off | `5` |
-| **rsync only** | | |
-| `RSYNC_OPTS`  | rsync options                                     | `-aHAX --numeric-ids --delete --delete-excluded` |
-| `SAVE_PERMS`  | Additionally save permissions via getfacl (1/0)   | `1`     |
-| **restic only** | | |
-| `RESTIC_REPO_PATH` | Repository path on the target                | `<REMOTE_BASE>/restic-<BACKUP_NAME>` |
-| `RESTIC_PASSWORD_FILE` | File containing the repository password  | `/etc/backup/restic.pass` |
-| `RESTIC_FORGET_OPTS` | Array of `restic forget` policies           | `--keep-daily 7 --keep-weekly 5 --keep-monthly 12` |
 
-`EXCLUDES` are rsync patterns; for restic a trailing `/` is dropped
-(`.cache/` becomes `.cache`, which restic matches as a name anywhere).
+`EXCLUDES` are restic patterns: a name without `/` (`.cache`) matches
+anywhere, `/home/*/Downloads` only that path. A trailing `/` is dropped.
 
-`-A` (ACLs) and `-X` (extended attributes) in `RSYNC_OPTS` require root on the
-target server. If you write there as a regular user, remove them.
-
-### restic retention
+### Retention
 
 By default restic keeps a staggered history of about one year:
 
@@ -150,9 +121,9 @@ RESTIC_FORGET_OPTS=(--keep-daily 7 --keep-weekly 5 --keep-monthly 12)
 - the last snapshot of each of the last 12 months.
 
 Thanks to deduplication this costs little more space than a few days. Any
-`restic forget` policy can be used (e.g. add `--keep-yearly 3`). With
-`RESTIC_FORGET_OPTS=()` restic falls back to `KEEP_DAYS`
-(`--keep-within <KEEP_DAYS>d`); with both empty/`0`, nothing is deleted.
+`restic forget` policy can be used, e.g. add `--keep-yearly 3`, or keep
+everything of the last 30 days with `(--keep-within 30d)`. With
+`RESTIC_FORGET_OPTS=()` nothing is deleted.
 
 Several machines may share one restic repository (same `RESTIC_REPO_PATH`
 and password) to deduplicate across them; snapshots and retention stay
@@ -161,31 +132,34 @@ separate per `BACKUP_NAME`.
 ### Hetzner Storage Box
 
 The sample configuration from `--init-config` is already set up for the
-Storage Box `u712238` (port 23, `REMOTE_BASE="."`, no `-A`/`-X`, key
-`/root/.ssh/backup_ed25519`). The host is derived from `REMOTE_USER`. The
-relevant values:
+Storage Box `u712238` (port 23, key `/root/.ssh/backup_ed25519`). The host is
+derived from `REMOTE_USER`:
 
 ```bash
 REMOTE_USER="u712238"
-REMOTE_HOST="u712238.your-storagebox.de"
+REMOTE_HOST="${REMOTE_USER}.your-storagebox.de"
 SSH_PORT=23
-REMOTE_BASE="."          # relative to the box's home
-RSYNC_OPTS=(-aH --numeric-ids --delete --delete-excluded)   # without -A/-X
 ```
 
 SSH support must be enabled in the Hetzner Console. Deploy the key with
 `ssh-copy-id -p 23 -s u712238@u712238.your-storagebox.de` (`-s` uses SFTP,
-because the box has no shell). With rsync, the box is not written to as root,
-so owners and groups of the files are not preserved; permissions are. That is
-what the permissions file is for, see "Restoring permissions". restic stores
-owners and groups in the repository, so this does not apply there.
+because the box has no shell).
+
+To keep machines apart, give each one its own sub-account
+(`u712238-sub1`, ...) with its own key. Its home then only contains that
+machine's repository, so it can live directly in the home:
+
+```bash
+REMOTE_USER="u712238-sub1"
+SSH_KEY="/root/.ssh/backup_sv32_ed25519"
+RESTIC_REPO_PATH="."
+```
 
 ## Usage
 
 ```
 backup.sh [-c FILE] [-n] [-v] [-h] [-V] [--init-config [FILE]]
 backup.sh [-c FILE] --test-mail
-backup.sh --restore-perms FILE [TARGET_ROOT] [-n]
 backup.sh [-c FILE] --restic RESTIC-ARGS...
 ```
 
@@ -196,16 +170,14 @@ backup.sh [-c FILE] --restic RESTIC-ARGS...
 | `-v` / `--progress` | live progress display (terminal only, see below) |
 | `--init-config [FILE]` | write a sample configuration |
 | `--test-mail` | send a test mail to `MAIL_TO` |
-| `--restore-perms FILE [TARGET_ROOT]` | rsync method: restore permissions, see below |
 | `--restic ARGS...` | run restic with the configured repository, password and SSH settings |
 | `-h` / `-V` | help / version |
 
-Exit code `0` on success, `1` on error. rsync code 24 (files vanished during
-the backup) counts as success and is only logged; the same applies to restic
-code 3 (some files could not be read), which is logged as a warning. Parallel
-runs are prevented by a `flock` lock.
+Exit code `0` on success, `1` on error. restic code 3 (some files could not
+be read) counts as success but is a warning. Parallel runs with the same
+configuration are prevented by a `flock` lock.
 
-Each source is transferred separately, and the log shows the progress:
+Each source is backed up separately, and the log shows the progress:
 
 ```
 [1/3] Backing up /etc ...
@@ -222,15 +194,10 @@ as incomplete, and the failed sources are listed.
 sudo backup.sh -v
 ```
 
-- **rsync:** an overall progress line per source (`--info=progress2`) with
-  bytes, percentage, speed and remaining files. The log only receives the
-  final state of that line, not every update. `--no-inc-recursive` is used so
-  the total is known from the start; for very large trees this needs some
-  more memory and a short scan before the transfer starts.
-- **restic:** restic's own progress bar (files, bytes, ETA). It is only drawn
-  when restic writes directly to the terminal, so with `-v` restic's normal
-  output (including its summary) goes to the terminal only; the script's own
-  log lines and restic's error messages are still logged.
+Shows restic's own progress bar (files, bytes, ETA). It is only drawn when
+restic writes directly to the terminal, so with `-v` restic's normal output
+(including its summary) goes to the terminal only; the script's own log
+lines and restic's error messages are still logged.
 
 Without a terminal (systemd, cron, output redirected) `-v` is ignored with a
 note, so the journal stays clean.
@@ -261,7 +228,7 @@ missing (as does `--init-config`):
   switches on, a post hook can reliably switch off again. A failing post
   hook makes the whole run exit with code 1.
 - Environment: `BACKUP_PHASE` (`pre`/`post`), `BACKUP_NAME`,
-  `BACKUP_METHOD`, `BACKUP_CONFIG`, `BACKUP_LOG_FILE`; post hooks
+  `BACKUP_CONFIG`, `BACKUP_LOG_FILE`; post hooks
   additionally get `BACKUP_RESULT` (`success`/`failure`) and
   `BACKUP_EXIT_CODE`.
 - Each hook may run at most `HOOK_TIMEOUT` seconds (default 3600).
@@ -383,7 +350,7 @@ With `MAIL_TO` set, the script sends a mail
   interrupted run;
 - **`[backup] WARNING: <name> (<date>)`** when the backup succeeded but
   there were warnings: less than `MIN_FREE_PERCENT` free space on the
-  target, unreadable files (restic code 3), old backups not removed.
+  target, unreadable files (restic code 3), old snapshots not removed.
 
 The mail contains the error, the warnings and the log of this run (last
 200 lines; empty if `LOG_FILE` is not writable). A dry run sends no mail,
@@ -456,43 +423,7 @@ journalctl -u backup.service
 `Persistent=true` catches up on a missed run, e.g. if the machine was off at
 night. Alternatively via cron: `30 2 * * * /opt/backup/backup.sh`.
 
-## Restoring (rsync)
-
-Each daily folder is a normal directory tree:
-
-```bash
-# Restore a single file from Nov 5
-sudo rsync -e 'ssh -p23 -i /root/.ssh/backup_ed25519' \
-    u712238@u712238.your-storagebox.de:sv32/2026-11-05/etc/fstab /tmp/
-
-# Whole directory from the latest snapshot
-sudo rsync -aH -e 'ssh -p23 -i /root/.ssh/backup_ed25519' \
-    u712238@u712238.your-storagebox.de:sv32/latest/home/alice/ /home/alice/
-```
-
-### Restoring permissions
-
-Before copying, the script uses `getfacl` to write owner, group, mode and ACLs
-of all files and directories in the sources to `.backup-perms.facl.gz`. The
-paths in it are relative (`etc/shadow`), so they can be applied to any target
-root. This matters most when the target cannot store owners, as with the
-Storage Box.
-
-```bash
-# Fetch the permissions file from the target
-sudo rsync -e 'ssh -p23 -i /root/.ssh/backup_ed25519' \
-    u712238@u712238.your-storagebox.de:sv32/2026-11-05/.backup-perms.facl.gz /tmp/
-
-# Check first, then apply (as root)
-sudo backup.sh --restore-perms /tmp/.backup-perms.facl.gz /mnt/restore -n
-sudo backup.sh --restore-perms /tmp/.backup-perms.facl.gz /mnt/restore
-```
-
-Without a target root, `/` is used. Entries for files missing in the target
-(e.g. due to excludes) are skipped and only counted. With `SAVE_PERMS=0` the
-permissions file is not created, and `acl` is not needed either.
-
-## Restoring (restic)
+## Restoring
 
 `backup.sh --restic` passes all following arguments to restic, with
 repository, password and SSH settings taken from the configuration:
@@ -517,15 +448,31 @@ sudo backup.sh --restic check
 Owners, groups, permissions, ACLs and extended attributes are restored by
 restic itself (as root).
 
+## Migrating from rsync (before 4.0.0)
+
+Up to 3.6 the script could also back up with rsync into plain daily
+folders. That method has been removed. To switch:
+
+1. Remove `BACKUP_METHOD`, `KEEP_DAYS`, `RSYNC_OPTS` and `SAVE_PERMS` from
+   the configuration (a remaining `BACKUP_METHOD="rsync"` makes the script
+   abort with a hint), set `RESTIC_REPO_PATH` and create the password file.
+2. Run a backup; the first run initializes the repository.
+3. The old daily folders (`<BACKUP_NAME>/2026-11-05/` …) stay on the target
+   untouched and can still be read with any SFTP client. Delete them
+   yourself (e.g. `rm -r` in lftp or FileZilla) once the restic history
+   covers what you need.
+
+Owners and permissions of an old rsync backup are in its
+`.backup-perms.facl.gz`; apply them after copying the files back:
+
+```bash
+cd /mnt/restore && zcat /tmp/.backup-perms.facl.gz | sudo setfacl --restore=-
+```
+
 ## Notes
 
-- rsync: hard links share their content – if you *edit* a file in a daily
-  folder on the server, you change it in all days. Only read backups.
-- rsync: `du -sh` across all days counts hard links only once;
-  `du -sh 2026-11-07` alone shows the full size.
-- rsync backups are not encrypted. For an off-site target, use the restic
-  method or an encrypted file system.
-- Switching `BACKUP_METHOD` does not migrate or delete existing backups; both
-  can coexist on the same box (`sv32/` and `restic-sv32/`).
+- Keep a copy of the repository password outside the server, and check the
+  repository now and then: `sudo backup.sh --restic check` (add
+  `--read-data-subset 5%` to also read part of the data).
 - Dump databases beforehand and back up the dump, not the live files – a
   pre hook does that automatically, see "Hooks".
