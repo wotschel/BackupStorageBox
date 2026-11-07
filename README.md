@@ -42,27 +42,33 @@ targets like the Hetzner Storage Box work as well.
 
 ## Setup
 
-The configuration `backup.conf` lives in the same directory as the script.
-Symlinks are resolved, so a link such as `/usr/local/sbin/backup.sh` still
-finds the configuration next to the real script.
+The script runs directly from a clone of the repository; the configuration
+lives separately in `/etc/backup/backup.conf`. Updating is therefore just a
+`git pull`, and the repository can be deleted and cloned again at any time
+without losing the configuration.
 
 ```bash
-# 1. Create an SSH key for the backup and deploy it
+# 1. Create an SSH key for the backup and deploy it to the Storage Box
 sudo ssh-keygen -t ed25519 -f /root/.ssh/backup_ed25519 -N ""
-sudo ssh-copy-id -i /root/.ssh/backup_ed25519 backup@backup.example.lan
+sudo ssh-copy-id -p 23 -s -i /root/.ssh/backup_ed25519 u712238@u712238.your-storagebox.de
 
-# 2. Install the script (directory only accessible by root)
-sudo install -d -m 700 /opt/backup
-sudo install -m 755 backup.sh /opt/backup/backup.sh
-sudo ln -s /opt/backup/backup.sh /usr/local/sbin/backup.sh   # optional
+# 2. Clone the repository and link the script
+sudo git clone https://github.com/wotschel/BackupStorageBox.git /opt/backup
+sudo ln -s /opt/backup/backup.sh /usr/local/sbin/backup.sh
 
 # 3. Create the sample configuration and adjust it
-sudo backup.sh --init-config          # -> /opt/backup/backup.conf
-sudo nano /opt/backup/backup.conf
+sudo backup.sh --init-config          # -> /etc/backup/backup.conf
+sudo nano /etc/backup/backup.conf       # check SOURCES, EXCLUDES, KEEP_DAYS
 
 # 4. Dry run, then a real run
 sudo backup.sh -n
 sudo backup.sh
+```
+
+Update later with:
+
+```bash
+sudo git -C /opt/backup pull
 ```
 
 ## Configuration
@@ -89,16 +95,21 @@ If you write there as a regular user, remove them from `RSYNC_OPTS`.
 
 ### Hetzner Storage Box
 
+The sample configuration from `--init-config` is already set up for the
+Storage Box `u712238` (port 23, `REMOTE_BASE="."`, no `-A`/`-X`, key
+`/root/.ssh/backup_ed25519`). The host is derived from `REMOTE_USER`. The
+relevant values:
+
 ```bash
-REMOTE_USER="u123456"
-REMOTE_HOST="u123456.your-storagebox.de"
+REMOTE_USER="u712238"
+REMOTE_HOST="u712238.your-storagebox.de"
 SSH_PORT=23
 REMOTE_BASE="."          # relative to the box's home
 RSYNC_OPTS=(-aH --numeric-ids --delete --delete-excluded)   # without -A/-X
 ```
 
 SSH support must be enabled in the Hetzner Console. Deploy the key with
-`ssh-copy-id -p 23 -s u123456@u123456.your-storagebox.de` (`-s` uses SFTP,
+`ssh-copy-id -p 23 -s u712238@u712238.your-storagebox.de` (`-s` uses SFTP,
 because the box has no shell). Since the box is not written to as root, owners
 and groups of the files are not preserved; permissions are. That is what the
 permissions file is for, see "Restoring permissions".
@@ -112,7 +123,7 @@ backup.sh --restore-perms FILE [TARGET_ROOT] [-n]
 
 | Option | Effect |
 |---|---|
-| `-c FILE` | different configuration (alternatively `BACKUP_CONF=...`); default `backup.conf` next to the script |
+| `-c FILE` | different configuration (alternatively `BACKUP_CONF=...`); default `/etc/backup/backup.conf` |
 | `-n` | dry run, nothing is changed |
 | `--init-config [FILE]` | write a sample configuration |
 | `--restore-perms FILE [TARGET_ROOT]` | restore permissions, see below |
@@ -195,7 +206,7 @@ Storage Box.
 
 ```bash
 # Fetch the permissions file from the target
-rsync -e 'ssh -p23' u123456@u123456.your-storagebox.de:myhost/2026-11-05/.backup-perms.facl.gz /tmp/
+rsync -e 'ssh -p23' u712238@u712238.your-storagebox.de:myhost/2026-11-05/.backup-perms.facl.gz /tmp/
 
 # Check first, then apply (as root)
 sudo backup.sh --restore-perms /tmp/.backup-perms.facl.gz /mnt/restore -n

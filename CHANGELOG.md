@@ -3,6 +3,20 @@
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 versioning according to [SemVer](https://semver.org/).
 
+## [3.0.0] – 2026-11-07
+
+### Changed
+- **Breaking:** the default configuration is `/etc/backup/backup.conf` again
+  instead of `backup.conf` next to the script, so the repository can be
+  updated with `git pull` or re-cloned without touching the configuration.
+  Move an existing `backup.conf` there or pass it with `-c` / `BACKUP_CONF`
+- Recommended installation: clone the repository to `/opt/backup` and link
+  `backup.sh` into `/usr/local/sbin`
+- Sample configuration from `--init-config` is preset for the Hetzner Storage
+  Box (port 23, `REMOTE_BASE="."`, `RSYNC_OPTS` without `-A`/`-X`, key
+  `/root/.ssh/backup_ed25519`) with user `u712238`; `REMOTE_HOST` is derived
+  from `REMOTE_USER`
+
 ## [2.0.0] – 2026-11-07
 
 ### Changed

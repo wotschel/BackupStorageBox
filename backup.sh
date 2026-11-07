@@ -8,12 +8,10 @@
 #
 set -euo pipefail
 
-readonly VERSION="2.0.0"
-# Default configuration: backup.conf in the same directory as the script
-# (symlinks are resolved, so a link in /usr/local/sbin still finds it).
-SCRIPT_DIR="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")"
-readonly SCRIPT_DIR
-readonly DEFAULT_CONFIG="${SCRIPT_DIR}/backup.conf"
+readonly VERSION="3.0.0"
+# Kept outside the script directory, so the repository can be updated or
+# re-cloned at any time without touching the configuration.
+readonly DEFAULT_CONFIG="/etc/backup/backup.conf"
 readonly MARKER=".backup-complete"
 readonly PERMS_FILE=".backup-perms.facl.gz"
 
@@ -83,15 +81,14 @@ config_template() {
     cat <<'EOF'
 # backup.conf – configuration for backup.sh (sourced as Bash)
 
-# --- Target server ---
-REMOTE_USER="backup"
-REMOTE_HOST="backup.example.lan"
-SSH_PORT=22
-SSH_KEY=""                      # empty = ssh default key (path without spaces)
+# --- Target server: Hetzner Storage Box ---
+REMOTE_USER="u712238"           # Storage Box user
+REMOTE_HOST="${REMOTE_USER}.your-storagebox.de"
+SSH_PORT=23                     # Storage Box SSH/rsync port
+SSH_KEY="/root/.ssh/backup_ed25519"   # empty = ssh default key (path without spaces)
 
 # --- Target path: <REMOTE_BASE>/<BACKUP_NAME>/<YYYY-MM-DD> ---
-# Hetzner Storage Box: SSH_PORT=23 and REMOTE_BASE="." (relative to home)
-REMOTE_BASE="/home"
+REMOTE_BASE="."                 # relative to the Storage Box home
 BACKUP_NAME="$(hostname -s)"
 
 # --- Directories to back up (absolute paths) ---
@@ -112,10 +109,10 @@ EXCLUDES=(
 KEEP_DAYS=30
 
 # --- rsync options ---
-# -A/-X (ACLs, extended attributes) require root on the target server.
-# As a regular user there (e.g. Hetzner Storage Box):
-#   RSYNC_OPTS=(-aH --numeric-ids --delete --delete-excluded)
-RSYNC_OPTS=(-aHAX --numeric-ids --delete --delete-excluded)
+# Without -A/-X: the Storage Box is not written to as root, so ACLs and
+# extended attributes cannot be stored there (SAVE_PERMS covers this).
+# For a target with root access: RSYNC_OPTS=(-aHAX --numeric-ids --delete --delete-excluded)
+RSYNC_OPTS=(-aH --numeric-ids --delete --delete-excluded)
 
 # --- Additionally save permissions with getfacl (1 = yes, 0 = no) ---
 # Important if the target cannot store owners/groups (e.g. Storage Box).

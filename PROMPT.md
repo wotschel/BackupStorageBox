@@ -19,8 +19,9 @@ Requirements:
   most recent complete backup.
 - The directories to back up, excludes, target settings (user, host, port,
   SSH key), retention in days, rsync options and log file are stored in a
-  configuration file (default `backup.conf` in the same directory as the
-  script, symlinks resolved; changeable via `-c` or `BACKUP_CONF`). Preserve
+  configuration file (default `/etc/backup/backup.conf`, outside the
+  repository so it survives `git pull` or a fresh clone; changeable via `-c`
+  or `BACKUP_CONF`). Preserve
   source paths at the target (`--relative`).
 - Option `--init-config` creates a commented sample configuration (the repo
   allows only four files per script, so no separate sample file).
