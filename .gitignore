@@ -1,0 +1,13 @@
+# Machine-specific wrappers stay local; only their directory guide is tracked.
+/wrappers/*
+!/wrappers/README.md
+!/wrappers/pre/
+!/wrappers/post/
+/wrappers/pre/*
+!/wrappers/pre/.gitkeep
+/wrappers/post/*
+!/wrappers/post/.gitkeep
+
+# Python test artifacts
+__pycache__/
+*.py[cod]

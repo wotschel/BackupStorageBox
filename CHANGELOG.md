@@ -3,6 +3,21 @@
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 versioning according to [SemVer](https://semver.org/).
 
+## [5.1.0] – 2026-11-07
+
+### Added
+- Local executable actions in `wrappers/pre/` and `wrappers/post/`, run by
+  `backup.sh` in deterministic filename order under its configuration lock.
+- Post actions on failures/signals after preparation starts; all cleanup
+  actions run even if one fails. Action output is logged and failures mailed.
+- `WRAPPERS_DIR` override and action environment with backup status/config/name.
+- Git-ignored user scripts with tracked directory placeholders and guide.
+- Regression coverage for ordering, errors, cleanup, dry runs and new sources.
+
+### Changed
+- Validate source existence after pre actions so they can create dump directories.
+- Dry runs and administrative commands skip local actions.
+
 ## [5.0.2] – 2026-11-07
 
 ### Fixed

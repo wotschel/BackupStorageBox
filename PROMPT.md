@@ -54,9 +54,17 @@ Requirements:
   `--test-mail` sends a test mail. Before the backup, check the free space
   on the target with `df` in sftp (no shell needed) and warn below
   `MIN_FREE_PERCENT` (default 5, 0 = off); if `df` fails, only log a note.
-- No hooks: steps before and after the backup belong in a wrapper script.
-  If `<config dir>/hooks/pre.d` or `post.d` still contain files (hooks of
-  versions 3.4–4.x), warn so they are not silently ignored.
+- Execute local scripts directly from `wrappers/pre/` and `wrappers/post/`
+  beside the resolved `backup.sh` (`WRAPPERS_DIR` configurable; empty disables).
+  Use ascending C-locale filename order, separate processes, executable files
+  only. Pre failure skips backup; all post scripts run after preparation starts,
+  including on errors/signals. Preserve failure status, log output and mail
+  action failures. Export BACKUP_CONFIG, BACKUP_NAME and BACKUP_EXIT_CODE.
+  Lock the whole lifecycle and check source existence after pre actions.
+  Skip actions for dry runs and administrative commands. Check root ownership
+  and writable permissions when executing as root. Ignore user action files in
+  Git but track directory placeholders and a guide. Old hooks/pre.d and post.d
+  remain inactive and generate a migration warning.
 - Wrapper `nextcloud-backup.sh [--check] [backup.sh options]` next to
   `backup.sh`: detect the installation (folder with `occ`), its user (owner
   of `config/config.php`) and the PHP version the web server uses (running

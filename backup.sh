@@ -6,8 +6,8 @@
 # (default restic-<BACKUP_NAME> in the home of the SSH user), one snapshot
 # per source, staggered retention via "restic forget --prune".
 #
-# Steps before and after the backup (database dump, maintenance mode) belong
-# in a wrapper script that calls this one, e.g. nextcloud-backup.sh.
+# Local actions in wrappers/pre and wrappers/post run around the backup.
+# Application-specific workflows can also use nextcloud-backup.sh.
 #
 # Mail (MAIL_TO): on failure, on warnings, and when the target has less than
 # MIN_FREE_PERCENT free space before the backup.
@@ -21,7 +21,8 @@ for d in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
 done
 export PATH
 
-readonly VERSION="5.0.2"
+readonly VERSION="5.1.0"
+readonly SCRIPT_DIR="$(dirname -- "$(realpath -- "$0")")"
 # Kept outside the script directory, so the repository can be updated or
 # re-cloned at any time without touching the configuration.
 readonly DEFAULT_CONFIG="/etc/backup/backup.conf"
@@ -38,6 +39,7 @@ TEST_MAIL=0
 LAST_ERROR=""
 WARNINGS=()
 LOG_START=0
+POST_PENDING=0
 
 # --- Helpers -----------------------------------------------------------------
 
@@ -143,6 +145,10 @@ EXCLUDES=(
 # (about one year of history). Any "restic forget" policy works, e.g.
 # (--keep-within 30d). Empty () = never delete.
 RESTIC_FORGET_OPTS=(--keep-daily 7 --keep-weekly 5 --keep-monthly 12)
+
+# --- Local actions (executable scripts, sorted by filename) ---
+# Default: wrappers/ next to backup.sh. Empty = disable local actions.
+# WRAPPERS_DIR="/etc/backup/wrappers"
 
 # --- Log file ---
 LOG_FILE="/var/log/backup.log"
@@ -254,8 +260,56 @@ on_exit() {
     local rc=$?
     trap - EXIT
     set +e
+    if (( POST_PENDING )); then
+        POST_PENDING=0
+        local post_rc=0
+        run_actions post "$rc" || post_rc=$?
+        (( rc == 0 && post_rc != 0 )) && rc=$post_rc
+    fi
     notify "$rc"
     exit "$rc"
+}
+
+# Execute child processes rather than sourcing user code into this shell.
+# Each phase uses a stable C-locale filename order; use 10-, 20-, ... prefixes.
+run_actions() {
+    local phase="$1" status="${2:-0}" script rc failed=0
+    [[ -n $WRAPPERS_DIR && -d $WRAPPERS_DIR/$phase ]] || return 0
+    while IFS= read -r -d '' script; do
+        [[ -f $script && -x $script ]] || continue
+        log "Running $phase action: $script"
+        if BACKUP_EXIT_CODE="$status" BACKUP_CONFIG="$CONFIG" BACKUP_NAME="$BACKUP_NAME" \
+            "$script" 2>&1 | tee -a "$LOG_FILE"; then
+            rc=0
+        else
+            local -a action_status=("${PIPESTATUS[@]}")
+            rc=${action_status[0]}
+            (( rc == 0 )) && rc=${action_status[1]}
+        fi
+        if (( rc != 0 )); then
+            LAST_ERROR="${LAST_ERROR:+$LAST_ERROR; }$phase action failed: $script (exit code $rc)"
+            log "ERROR: $phase action failed: $script (exit code $rc)"
+            failed=1
+            [[ $phase == pre ]] && return 1
+        fi
+    done < <(printf '%s\0' "$WRAPPERS_DIR/$phase/"* | LC_ALL=C sort -z)
+    return "$failed"
+}
+
+# Check every action before preparation so an unsafe post action cannot leave
+# an application stopped. Configuration and scripts are trusted local code.
+validate_actions() {
+    local phase script owner perms
+    [[ -n $WRAPPERS_DIR ]] || return 0
+    for phase in pre post; do
+        for script in "$WRAPPERS_DIR/$phase/"*; do
+            [[ -f $script && -x $script ]] || continue
+            read -r owner perms < <(stat -L -c '%u %a' -- "$script")
+            if (( EUID == 0 && (owner != 0 || (8#$perms & 8#022)) )); then
+                die "Action must be owned by root and not writable by group/others: $script"
+            fi
+        done
+    done
 }
 
 # Hooks were removed in 5.0.0. Installed ones would silently no longer run
@@ -265,7 +319,7 @@ check_old_hooks() {
     dir="$(dirname -- "$CONFIG")/hooks"
     for f in "$dir"/pre.d/* "$dir"/post.d/*; do
         if [[ -f $f ]]; then
-            warn "Hooks are no longer supported since 5.0.0 – $dir is NOT run. Use a wrapper script (e.g. nextcloud-backup.sh) and delete $dir."
+            warn "Hooks are no longer supported since 5.0.0 – $dir is NOT run. Move executable actions to $WRAPPERS_DIR/pre and $WRAPPERS_DIR/post, or use nextcloud-backup.sh; then delete $dir."
             return 0
         fi
     done
@@ -326,6 +380,7 @@ BACKUP_METHOD="restic"   # only for old configurations, see below
 REMOTE_USER=""; REMOTE_HOST=""; SSH_PORT=22; SSH_KEY=""
 REMOTE_BASE=""; BACKUP_NAME="$(hostname -s)"
 SOURCES=(); EXCLUDES=()
+WRAPPERS_DIR="$SCRIPT_DIR/wrappers"
 RESTIC_REPO_PATH=""
 RESTIC_PASSWORD_FILE="/etc/backup/restic.pass"
 RESTIC_FORGET_OPTS=(--keep-daily 7 --keep-weekly 5 --keep-monthly 12)
@@ -355,15 +410,6 @@ only restic is available. Remove BACKUP_METHOD from $CONFIG and set up restic (s
 [[ -n $BACKUP_NAME ]]          || die "BACKUP_NAME is missing in $CONFIG"
 [[ $MIN_FREE_PERCENT =~ ^[0-9]+$ ]] && (( MIN_FREE_PERCENT <= 100 )) \
                                || die "MIN_FREE_PERCENT must be an integer from 0 to 100"
-# Recovery and mail tests must also work after the original sources are lost.
-if (( ! RESTIC_PASSTHRU && ! TEST_MAIL )); then
-    (( ${#SOURCES[@]} > 0 )) || die "SOURCES is empty"
-    for src in "${SOURCES[@]}"; do
-        [[ $src == /* ]] || die "Source must be an absolute path: $src"
-        [[ -e $src ]] || die "Source does not exist: $src"
-    done
-fi
-
 # --- SSH basics --------------------------------------------------------------
 #
 # NO shell commands are run on the target – only SFTP.
@@ -513,4 +559,17 @@ flock -n 9 || die "A backup with $CONFIG is already running."
 
 check_old_hooks
 check_free_space
+
+if (( ! DRY_RUN )); then
+    validate_actions
+    POST_PENDING=1
+    run_actions pre || exit 1
+fi
+
+# Pre actions may create sources such as the database dump directory.
+(( ${#SOURCES[@]} > 0 )) || die "SOURCES is empty"
+for src in "${SOURCES[@]}"; do
+    [[ $src == /* ]] || die "Source must be an absolute path: $src"
+    [[ -e $src ]] || die "Source does not exist: $src"
+done
 backup_restic

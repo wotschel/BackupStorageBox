@@ -27,12 +27,14 @@ removes old snapshots of this host according to the retention policy.
 A run consists of:
 
 1. check the free space on the target (`MIN_FREE_PERCENT`),
-2. restic backup per source, then `forget --prune`,
-3. mail if something failed or there were warnings.
+2. run executable scripts from `wrappers/pre/`,
+3. restic backup per source, then `forget --prune`,
+4. run executable scripts from `wrappers/post/`, including after failures,
+5. mail if something failed or there were warnings.
 
-Anything that has to happen before or after – dumping a database, putting
-an application into maintenance mode – goes into a wrapper script that calls
-`backup.sh`, see "Nextcloud" and "Own steps before and after the backup".
+Custom actions such as database dumps or application maintenance can run
+directly through `wrappers/pre/` and `wrappers/post/`. For the complete
+Nextcloud workflow, use `nextcloud-backup.sh`; see "Nextcloud".
 
 The repository password is read from `RESTIC_PASSWORD_FILE` (default
 `/etc/backup/restic.pass`). **Without this password all backups are lost** –
@@ -100,6 +102,7 @@ for the Storage Box (see below).
 | `SOURCES`     | Array of directories to back up (absolute)        | –       |
 | `EXCLUDES`    | Array of restic exclude patterns                  | empty   |
 | `RESTIC_FORGET_OPTS` | Array of `restic forget` policies, `()` = never delete | `--keep-daily 7 --keep-weekly 5 --keep-monthly 12` |
+| `WRAPPERS_DIR` | Local action directory; empty disables actions | `wrappers/` next to the resolved `backup.sh` |
 | `LOG_FILE`    | Log file                                          | `/dev/null` (sample: `/var/log/backup.log`) |
 | `MAIL_TO`     | Mail recipients (comma-separated), see "Mail"     | empty = no mails |
 | `MAIL_FROM`   | Sender address                                    | empty = mail system default |
@@ -292,29 +295,88 @@ Not supported: snap and Docker installations.
 
 ## Own steps before and after the backup
 
-`backup.sh` itself only backs up. Wrap it in a small script for anything
-else; a `trap` makes sure the "after" part always runs:
+Call `backup.sh` as usual. It automatically runs executable files from:
 
-```bash
-#!/bin/bash
-set -euo pipefail
-umask 077
-
-trap 'systemctl start myapp' EXIT     # always, also on errors and Ctrl+C
-systemctl stop myapp
-
-mkdir -p /var/backups/mysql
-mysqldump --all-databases --single-transaction --routines --events \
-    | gzip > /var/backups/mysql/all-databases.sql.gz.tmp
-mv /var/backups/mysql/all-databases.sql.gz.tmp /var/backups/mysql/all-databases.sql.gz
-
-/opt/backup/backup.sh "$@"
+```text
+wrappers/
+  pre/
+    10-stop-myapp.sh
+    20-dump-database.sh
+  post/
+    10-start-myapp.sh
+    20-report.sh
 ```
 
-Keep in mind that `backup.sh` only mails its own failures: if the wrapper
-fails before calling it (e.g. the dump), no mail is sent. Let systemd
-report that (`OnFailure=` in the service) or send a mail from the wrapper,
-as `nextcloud-backup.sh` does.
+Both phases run in ascending filename order using the C locale. Use fixed-width
+numeric prefixes (`10-`, `20-`, `30-`) to make the sequence explicit; `10` sorts
+before `2`. Post order is also ascending, not reversed. Only executable,
+non-hidden files directly inside each directory run; subdirectories and
+non-executable files are skipped. Each script runs as a separate process with
+its own shebang, as the user running `backup.sh`, and cannot change its shell
+variables or working directory. Use absolute paths inside your scripts.
+
+For example, create `/opt/backup/wrappers/pre/10-stop-myapp.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+systemctl stop myapp
+```
+
+And `/opt/backup/wrappers/post/10-start-myapp.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+systemctl start myapp
+# BACKUP_EXIT_CODE contains the status before post actions (0 = success).
+```
+
+Enable the scripts and run the backup normally:
+
+```bash
+sudo chmod 700 /opt/backup/wrappers/pre/10-stop-myapp.sh
+sudo chmod 700 /opt/backup/wrappers/post/10-start-myapp.sh
+sudo /opt/backup/backup.sh
+```
+
+The directory defaults to `wrappers/` beside the resolved script, independent
+of the caller's working directory. Override it in `backup.conf`:
+
+```bash
+WRAPPERS_DIR="/etc/backup/wrappers"
+# WRAPPERS_DIR=""   # disable local actions
+```
+
+A pre failure aborts preparation and skips the backup. Once preparation has
+started, the EXIT trap runs **all** post actions, even after a pre failure,
+a backup failure, or HUP/INT/TERM. Post scripts must tolerate partial
+preparation. A post failure does not prevent later post scripts from running,
+but makes the run fail. SIGKILL and power loss cannot trigger cleanup.
+Early setup errors and a rejected lock do not run either phase.
+
+Scripts receive `BACKUP_CONFIG`, `BACKUP_NAME`, and `BACKUP_EXIT_CODE` as
+environment variables. The last is `0` for pre actions and the wrapper's
+status before cleanup for every post action (not the raw restic exit code).
+Output is written to the console and backup log; action failures are included
+in the usual failure notification. The configuration lock covers both phases.
+Pre actions can create source directories before source existence is checked.
+
+Dry runs (`-n`), help, version, configuration generation, mail tests and
+`--restic` commands skip all actions. With `nextcloud-backup.sh`, actions run
+inside its maintenance window when it calls `backup.sh`; use them for
+additional tasks rather than duplicating its maintenance/database steps.
+
+Git ignores user scripts in these directories; only the directory placeholders
+and README are tracked. Normal `git pull` updates leave your scripts intact.
+Create them separately on each machine and keep a backup: `git clean -fdx`
+removes ignored files. When running as root, executable actions must be owned
+by root and not writable by group or others. Keep their directories protected
+from untrusted writers as well.
+
+Old `<config dir>/hooks/pre.d` and `post.d` are still ignored with a warning.
+Review and move their scripts into the new directories to enable them.
+Cron and systemd continue to call `backup.sh` (or the Nextcloud wrapper).
 
 ## Mail notification
 
