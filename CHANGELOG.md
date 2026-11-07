@@ -5,6 +5,17 @@ versioning according to [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Structured logging with ISO timestamps, severity, unique run IDs and phases,
+  including captured restic/action output and action duration/exit codes.
+- Final status and source counts after post actions, including failure paths.
+- Daily logrotate configuration with 30 archives, max age 30 days and compression.
+
+### Changed
+- Default log path is `/var/log/backup/backup.log`; new files/directories use
+  restrictive permissions. Existing configured paths remain supported.
+- Mail excerpts select the run ID instead of byte offsets in a shared log.
+
 ### Fixed
 - Warn when local pre/post action files lack execute permission, including
   the file path and a `chmod +x` hint, instead of silently skipping them.

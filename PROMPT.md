@@ -33,8 +33,15 @@ Requirements:
   `--keep-daily 7 --keep-weekly 5 --keep-monthly 12`; empty = never delete.
 - `--restic ARGS...` passes arguments to restic with the configured settings
   (snapshots, restore, mount, check, ...).
-- Prevent parallel runs via `flock` on the configuration file, log with
-  timestamps, `set -euo pipefail`, shellcheck-clean.
+- Prevent parallel runs via `flock` on the configuration file. Default log
+  `/var/log/backup/backup.log`, configurable; use restrictive file permissions
+  and clear console fallback warnings. Prefix lines with ISO timestamp,
+  severity, run ID and phase, including child command output. Log action
+  durations/exit codes; emit a single summary after post actions with status,
+  duration and successful/failed source counts. Preserve terminal progress.
+  Supply a daily logrotate configuration (30 archives, max age 30 days,
+  compression). Never print password contents. Use `set -euo pipefail`.
+
 - Do not run shell commands on the target, only SFTP, so that the Hetzner
   Storage Box with its restricted shell works too.
 - At startup, check whether `restic` is available; install it as root via

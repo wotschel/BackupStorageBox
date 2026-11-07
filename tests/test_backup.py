@@ -1,6 +1,8 @@
 """Regression checks using a fake restic; never contact a backup server."""
 import os
 import fcntl
+import re
+import stat
 from pathlib import Path
 import subprocess
 import tempfile
@@ -19,7 +21,7 @@ class BackupTests(unittest.TestCase):
         restic.write_text('''#!/bin/bash
 printf '%s\\n' "$*" >> "$CALLS"
 case " $* " in
-    *" backup "*) exit "${BACKUP_RC:-0}" ;;
+    *" backup "*) echo "snapshot output"; exit "${BACKUP_RC:-0}" ;;
 esac
 ''')
         restic.chmod(0o700)
@@ -29,14 +31,15 @@ esac
         self.env = dict(os.environ, PATH=f'{self.base}:{os.environ["PATH"]}',
                         CALLS=str(self.calls))
 
-    def run_backup(self, source, *args, rc=0):
+    def run_backup(self, source, *args, rc=0, log_file="/dev/null", config_extra=""):
         self.config.write_text(f'''REMOTE_USER=test
 REMOTE_HOST=example.invalid
 SOURCES=('{source}')
 RESTIC_PASSWORD_FILE='{self.password}'
 MIN_FREE_PERCENT=0
-LOG_FILE=/dev/null
+LOG_FILE='{log_file}'
 WRAPPERS_DIR='{self.base / 'wrappers'}'
+{config_extra}
 ''')
         return subprocess.run(['bash', str(ROOT / 'backup.sh'), '-c',
                                str(self.config), *args], env=dict(self.env, BACKUP_RC=str(rc)),
@@ -138,6 +141,92 @@ WRAPPERS_DIR='{self.base / 'wrappers'}'
         result = self.run_backup(self.base)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn('Skipping pre action:', result.stdout)
+
+    def test_structured_log_and_final_summary_after_cleanup(self):
+        logfile = self.base / 'logs' / 'backup.log'
+        self.action('pre', '10-prepare', 'printf "first\\nsecond\\n"')
+        self.action('post', '10-cleanup', 'echo cleanup-output')
+        result = self.run_backup(self.base, log_file=logfile)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        content = logfile.read_text()
+        self.assertEqual(content, result.stdout)
+        lines = content.splitlines()
+        pattern = r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2} (INFO|WARN|ERROR|OUTPUT) \[([^]]+)\] [a-z]+: '
+        run_ids = set()
+        for line in lines:
+            match = re.match(pattern, line)
+            self.assertIsNotNone(match, line)
+            run_ids.add(match.group(2))
+        self.assertEqual(len(run_ids), 1)
+        self.assertIn('pre: first', content)
+        self.assertIn('pre: second', content)
+        self.assertIn('backup: snapshot output', content)
+        self.assertIn('post: Finished post action:', content)
+        self.assertIn('duration=', content)
+        self.assertIn('exit=0', content)
+        self.assertIn('summary: finished status=OK', lines[-1])
+        self.assertIn('sources_ok=1 sources_failed=0', lines[-1])
+        self.assertNotIn('test-only', content)
+        self.assertEqual(stat.S_IMODE(logfile.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(logfile.parent.stat().st_mode), 0o700)
+
+    def test_post_failure_is_reflected_in_final_summary(self):
+        self.action('post', '10-fail', 'exit 8')
+        result = self.run_backup(self.base)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('summary: finished status=FAILED', result.stdout.splitlines()[-1])
+        self.assertIn('Finished post action:', result.stdout)
+        self.assertIn('exit=8', result.stdout)
+
+    def test_warning_and_failed_source_summary(self):
+        for rc, status, counts in [(3, 'WARNING', 'sources_ok=1 sources_failed=0'),
+                                    (2, 'FAILED', 'sources_ok=0 sources_failed=1')]:
+            with self.subTest(rc=rc):
+                result = self.run_backup(self.base, rc=rc)
+                summary = result.stdout.splitlines()[-1]
+                self.assertIn('summary: finished status=' + status, summary)
+                self.assertIn(counts, summary)
+
+    def test_log_failure_falls_back_to_console(self):
+        blocked = self.base / 'not-a-directory'
+        blocked.write_text('blocked')
+        result = self.run_backup(self.base, log_file=blocked / 'backup.log')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('logging to the console only', result.stdout)
+        self.assertIn('summary: finished status=WARNING', result.stdout)
+
+    def test_logging_continues_after_rotation(self):
+        logfile = self.base / 'backup.log'
+        self.action('pre', '10-rotate', f'mv "{logfile}" "{logfile}.1"; echo after-rotation')
+        result = self.run_backup(self.base, log_file=logfile)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('started backup=', Path(str(logfile) + '.1').read_text())
+        self.assertIn('pre: after-rotation', logfile.read_text())
+        self.assertIn('summary: finished status=OK', logfile.read_text())
+
+    def test_administrative_command_does_not_create_log(self):
+        logfile = self.base / 'logs' / 'backup.log'
+        result = self.run_backup(self.base / 'missing', '--restic', 'snapshots', log_file=logfile)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(logfile.exists())
+        self.assertNotIn('summary:', result.stdout)
+
+    def test_mail_excerpt_only_contains_current_run(self):
+        logfile = self.base / 'backup.log'
+        logfile.write_text('old-run-secret-marker\n')
+        mailbox = self.base / 'mail'
+        sendmail = self.base / 'sendmail'
+        sendmail.write_text('#!/bin/bash\ncat > "' + str(mailbox) + '"\n')
+        sendmail.chmod(0o700)
+        self.action('post', '10-fail', 'exit 8')
+        result = self.run_backup(self.base, log_file=logfile,
+                                 config_extra='MAIL_TO="test@example.invalid"')
+        self.assertEqual(result.returncode, 1)
+        mail = mailbox.read_text()
+        self.assertIn('Run ID:', mail)
+        self.assertIn('summary: finished status=FAILED', mail)
+        self.assertNotIn('old-run-secret-marker', mail)
+        self.assertNotIn('test-only', mail)
 
     def test_signal_runs_post(self):
         self.action('pre', '10-signal', 'kill -TERM "$PPID"')

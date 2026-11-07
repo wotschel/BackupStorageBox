@@ -12,6 +12,7 @@
 # MIN_FREE_PERCENT free space before the backup.
 #
 set -euo pipefail
+umask 077
 
 # cron starts jobs with PATH=/usr/bin:/bin – add the sbin directories so that
 # runuser, sendmail etc. are found there too
@@ -20,7 +21,7 @@ for d in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
 done
 export PATH
 
-readonly VERSION="5.1.0"
+readonly VERSION="5.2.0"
 readonly SCRIPT_DIR="$(dirname -- "$(realpath -- "$0")")"
 # Kept outside the script directory, so the repository can be updated or
 # re-cloned at any time without touching the configuration.
@@ -37,22 +38,61 @@ LOG_FILE="/dev/null"
 TEST_MAIL=0
 LAST_ERROR=""
 WARNINGS=()
-LOG_START=0
+readonly RUN_ID="$(date -u '+%Y%m%dT%H%M%SZ')-$$"
+LOG_PHASE=setup
+LOG_READY=0
+LOG_WRITE_WARNED=0
+RUN_STARTED=0
+SOURCES_OK=0
+SOURCES_FAILED=0
 POST_PENDING=0
 
 # --- Helpers -----------------------------------------------------------------
 
-log() {
-    local line
-    line="$(date '+%F %T') $*"
-    echo "$line"
-    echo "$line" >> "$LOG_FILE" 2>/dev/null || true
+log_level() {
+    local level="$1" message line
+    shift
+    # Prefix every line, including multiline errors and child process output.
+    while IFS= read -r message || [[ -n $message ]]; do
+        line="$(date '+%Y-%m-%dT%H:%M:%S%:z') $level [$RUN_ID] $LOG_PHASE: $message"
+        printf '%s\n' "$line"
+        if (( LOG_READY )) && [[ $LOG_FILE != /dev/null ]]; then
+            if ! { printf '%s\n' "$line" >> "$LOG_FILE"; } 2>/dev/null; then
+                if (( ! LOG_WRITE_WARNED )); then
+                    printf '%s WARN [%s] %s: Cannot write log file %s; continuing on console.\n' \
+                        "$(date '+%Y-%m-%dT%H:%M:%S%:z')" "$RUN_ID" "$LOG_PHASE" "$LOG_FILE" >&2
+                    LOG_WRITE_WARNED=1
+                fi
+            fi
+        fi
+    done <<< "$*"
 }
 
-die() { LAST_ERROR="$*"; log "ERROR: $*"; exit 1; }
+log() { log_level INFO "$*"; }
+die() { LAST_ERROR="$*"; log_level ERROR "$*"; exit 1; }
+warn() { WARNINGS+=("$*"); log_level WARN "Warning: $*"; }
 
-# Logs a warning and collects it for the notification mail
-warn() { WARNINGS+=("$*"); log "Warning: $*"; }
+log_output() {
+    local line
+    while IFS= read -r line || [[ -n $line ]]; do
+        log_level OUTPUT "$line"
+    done
+}
+
+setup_logging() {
+    local requested="$LOG_FILE" dir
+    [[ $LOG_FILE == /dev/null ]] && { LOG_READY=1; return 0; }
+    dir="$(dirname -- "$LOG_FILE")"
+    # Apply restrictive permissions to new directories/files only.
+    if (umask 077; mkdir -p -- "$dir" && touch -- "$LOG_FILE") 2>/dev/null \
+       && [[ -f $LOG_FILE && -w $LOG_FILE ]]; then
+        LOG_READY=1
+    else
+        LOG_FILE=/dev/null
+        LOG_READY=1
+        warn "Log file $requested is not writable; logging to the console only."
+    fi
+}
 
 # Makes sure a command is available; otherwise installs its package.
 # Usage: ensure_cmd COMMAND PACKAGE
@@ -69,10 +109,10 @@ ensure_cmd() {
     command -v apt-get >/dev/null || die "$cmd is missing and apt-get is not available. Please install package $pkg."
 
     log "$cmd is missing – installing package $pkg ..."
-    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pkg" >>"$LOG_FILE" 2>&1; then
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pkg" 2>&1 | log_output; then
         log "Installation failed, updating package lists and retrying ..."
-        DEBIAN_FRONTEND=noninteractive apt-get update -qq >>"$LOG_FILE" 2>&1 || true
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pkg" >>"$LOG_FILE" 2>&1 \
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>&1 | log_output || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pkg" 2>&1 | log_output \
             || die "Could not install package $pkg. Please install it manually: sudo apt install $pkg"
     fi
     command -v "$cmd" >/dev/null || die "$cmd still not found after installing $pkg."
@@ -150,7 +190,7 @@ RESTIC_FORGET_OPTS=(--keep-daily 7 --keep-weekly 5 --keep-monthly 12)
 # WRAPPERS_DIR="/etc/backup/wrappers"
 
 # --- Log file ---
-LOG_FILE="/var/log/backup.log"
+LOG_FILE="/var/log/backup/backup.log"
 
 # --- Notifications ---
 # Mail to MAIL_TO (comma-separated) when the backup fails or has warnings,
@@ -205,7 +245,7 @@ send_mail() {
     sm="$(command -v sendmail 2>/dev/null || true)"
     [[ -z $sm && -x /usr/sbin/sendmail ]] && sm=/usr/sbin/sendmail
     if [[ -z $sm ]]; then
-        log "Warning: cannot send mail – no sendmail found (install e.g. msmtp-mta or postfix)."
+        log_level WARN "Warning: cannot send mail – no sendmail found (install e.g. msmtp-mta or postfix)."
         return 1
     fi
     local rc=0
@@ -218,7 +258,7 @@ send_mail() {
         cat
     } | "$sm" -t -oi || rc=$?
     if (( rc != 0 )); then
-        log "Warning: sending the mail to $MAIL_TO failed (sendmail exit code $rc)."
+        log_level WARN "Warning: sending the mail to $MAIL_TO failed (sendmail exit code $rc)."
         return 1
     fi
     log "Mail sent to $MAIL_TO: $subject"
@@ -242,6 +282,7 @@ notify() {
         echo "Configuration: $CONFIG"
         echo "Repository:    ${RESTIC_REPOSITORY:-?}"
         echo "Duration:      ${SECONDS}s"
+        echo "Run ID:        $RUN_ID"
         [[ -n $LAST_ERROR ]] && printf '\nError:\n  %s\n' "$LAST_ERROR"
         if (( ${#WARNINGS[@]} > 0 )); then
             printf '\nWarnings:\n'
@@ -249,7 +290,7 @@ notify() {
         fi
         if [[ $LOG_FILE != /dev/null && -r $LOG_FILE ]]; then
             printf '\n--- Log of this run (last 200 lines, full log: %s) ---\n' "$LOG_FILE"
-            tail -c "+$((LOG_START + 1))" -- "$LOG_FILE" | tail -n 200
+            { grep -F -- "[$RUN_ID]" "$LOG_FILE" || true; } | tail -n 200
         fi
     } | send_mail "[backup] $status: $BACKUP_NAME ($(date +%F))"
 }
@@ -265,6 +306,17 @@ on_exit() {
         run_actions post "$rc" || post_rc=$?
         (( rc == 0 && post_rc != 0 )) && rc=$post_rc
     fi
+    if (( RUN_STARTED )); then
+        local status=OK level=INFO
+        LOG_PHASE=summary
+        if (( rc != 0 )); then
+            status=FAILED; level=ERROR
+        elif (( ${#WARNINGS[@]} > 0 )); then
+            status=WARNING; level=WARN
+        fi
+        log_level "$level" "finished status=$status duration=${SECONDS}s sources_ok=$SOURCES_OK sources_failed=$SOURCES_FAILED warnings=${#WARNINGS[@]} exit=$rc dry_run=$DRY_RUN"
+    fi
+    LOG_PHASE=notify
     notify "$rc"
     exit "$rc"
 }
@@ -272,7 +324,8 @@ on_exit() {
 # Execute child processes rather than sourcing user code into this shell.
 # Each phase uses a stable C-locale filename order; use 10-, 20-, ... prefixes.
 run_actions() {
-    local phase="$1" status="${2:-0}" script rc enable_cmd failed=0
+    local phase="$1" status="${2:-0}" script rc enable_cmd started failed=0
+    LOG_PHASE="$phase"
     [[ -n $WRAPPERS_DIR && -d $WRAPPERS_DIR/$phase ]] || return 0
     while IFS= read -r -d '' script; do
         [[ -f $script ]] || continue
@@ -281,18 +334,22 @@ run_actions() {
             warn "Skipping $phase action: $script is not executable. Enable it with: $enable_cmd"
             continue
         fi
+        started=$SECONDS
         log "Running $phase action: $script"
         if BACKUP_EXIT_CODE="$status" BACKUP_CONFIG="$CONFIG" BACKUP_NAME="$BACKUP_NAME" \
-            "$script" 2>&1 | tee -a "$LOG_FILE"; then
+            "$script" 2>&1 | log_output; then
             rc=0
         else
             local -a action_status=("${PIPESTATUS[@]}")
             rc=${action_status[0]}
             (( rc == 0 )) && rc=${action_status[1]}
         fi
+        local level=INFO
+        (( rc != 0 )) && level=ERROR
+        log_level "$level" "Finished $phase action: $script duration=$((SECONDS - started))s exit=$rc"
         if (( rc != 0 )); then
             LAST_ERROR="${LAST_ERROR:+$LAST_ERROR; }$phase action failed: $script (exit code $rc)"
-            log "ERROR: $phase action failed: $script (exit code $rc)"
+            log_level ERROR "$phase action failed: $script (exit code $rc)"
             failed=1
             [[ $phase == pre ]] && return 1
         fi
@@ -385,6 +442,7 @@ REMOTE_USER=""; REMOTE_HOST=""; SSH_PORT=22; SSH_KEY=""
 REMOTE_BASE=""; BACKUP_NAME="$(hostname -s)"
 SOURCES=(); EXCLUDES=()
 WRAPPERS_DIR="$SCRIPT_DIR/wrappers"
+LOG_FILE="/var/log/backup/backup.log"
 RESTIC_REPO_PATH=""
 RESTIC_PASSWORD_FILE="/etc/backup/restic.pass"
 RESTIC_FORGET_OPTS=(--keep-daily 7 --keep-weekly 5 --keep-monthly 12)
@@ -393,12 +451,14 @@ MAIL_TO=""; MAIL_FROM=""; MIN_FREE_PERCENT=5
 # shellcheck source=/dev/null
 source "$CONFIG"
 
-if ! touch "$LOG_FILE" 2>/dev/null; then
-    (( RESTIC_PASSTHRU )) || echo "Warning: log file $LOG_FILE is not writable, logging to the console only." >&2
-    LOG_FILE="/dev/null"
+# Keep administrative command output clean and avoid creating backup logs.
+if (( ! RESTIC_PASSTHRU && ! TEST_MAIL )); then
+    LOG_FILE="${LOG_FILE:-/var/log/backup/backup.log}"
+    setup_logging
+    RUN_STARTED=1
+    log "started backup=$BACKUP_NAME config=$CONFIG sources=${#SOURCES[@]} version=$VERSION dry_run=$DRY_RUN"
+    for src in "${SOURCES[@]}"; do log "source=$src"; done
 fi
-# Start of this run in the log, for the excerpt in the notification mail
-LOG_START=$(stat -c %s -- "$LOG_FILE" 2>/dev/null || echo 0)
 
 # From here on errors are reported by mail. The signal traps exit, which
 # triggers the EXIT trap.
@@ -456,7 +516,8 @@ restic_repo_exists() {
 
 backup_restic() {
     local rc
-    log "=== Backup $BACKUP_NAME -> $RESTIC_REPOSITORY (v$VERSION) ==="
+    LOG_PHASE=backup
+    log "Repository: $RESTIC_REPOSITORY"
     (( DRY_RUN )) && log "DRY RUN – nothing will be changed."
 
     if ! restic_repo_exists; then
@@ -467,7 +528,7 @@ backup_restic() {
         fi
         log "Repository does not exist yet – initializing ..."
         set +e
-        restic "${RESTIC_ARGS[@]}" init 2>&1 | tee -a "$LOG_FILE"
+        restic "${RESTIC_ARGS[@]}" init 2>&1 | log_output
         rc=${PIPESTATUS[0]}
         set -e
         (( rc == 0 )) || die "Could not initialize the restic repository (exit code $rc)."
@@ -489,19 +550,22 @@ backup_restic() {
         if (( PROGRESS )); then
             # restic only draws its progress bar when stdout is a terminal,
             # so stdout goes there directly; errors are still logged.
-            restic "${RESTIC_ARGS[@]}" "${args[@]}" "$src" 2> >(tee -a "$LOG_FILE" >&2)
+            restic "${RESTIC_ARGS[@]}" "${args[@]}" "$src" 2> >(log_output >&2)
             rc=$?
         else
-            restic "${RESTIC_ARGS[@]}" "${args[@]}" "$src" 2>&1 | tee -a "$LOG_FILE"
+            restic "${RESTIC_ARGS[@]}" "${args[@]}" "$src" 2>&1 | log_output
             rc=${PIPESTATUS[0]}
         fi
         set -e
         case $rc in
-            0) log "[$n/${#SOURCES[@]}] $src done." ;;
+            0) SOURCES_OK=$((SOURCES_OK + 1))
+               log "[$n/${#SOURCES[@]}] $src done." ;;
             3) incomplete=1
+               SOURCES_OK=$((SOURCES_OK + 1))
                log "[$n/${#SOURCES[@]}] $src done."
                warn "$src: some files could not be read (restic exit code 3)." ;;
-            *) log "[$n/${#SOURCES[@]}] ERROR for $src (restic exit code $rc)."
+            *) SOURCES_FAILED=$((SOURCES_FAILED + 1))
+               log_level ERROR "[$n/${#SOURCES[@]}] ERROR for $src (restic exit code $rc)."
                failed+=("$src") ;;
         esac
     done
@@ -509,6 +573,7 @@ backup_restic() {
     (( ${#failed[@]} == 0 )) \
         || die "Backup $TODAY is INCOMPLETE – failed: ${failed[*]}"
 
+    LOG_PHASE=retention
     # Retention: only snapshots of this host; prune removes unreferenced data
     if (( incomplete )); then
         warn "Retention skipped because files could not be read; keeping previous snapshots."
@@ -517,17 +582,10 @@ backup_restic() {
         local -a fargs=(forget --host "$BACKUP_NAME" --prune "${RESTIC_FORGET_OPTS[@]}")
         (( DRY_RUN )) && fargs+=(--dry-run)
         set +e
-        restic "${RESTIC_ARGS[@]}" "${fargs[@]}" 2>&1 | tee -a "$LOG_FILE"
+        restic "${RESTIC_ARGS[@]}" "${fargs[@]}" 2>&1 | log_output
         rc=${PIPESTATUS[0]}
         set -e
         (( rc == 0 )) || warn "Removing old snapshots failed (restic exit code $rc)."
-    fi
-
-    if (( DRY_RUN )); then
-        log "Dry run finished (${SECONDS}s)."
-    else
-        log "Backup $TODAY complete."
-        log "=== Done after ${SECONDS}s ==="
     fi
 }
 
@@ -561,6 +619,7 @@ fi
 exec 9<"$CONFIG"
 flock -n 9 || die "A backup with $CONFIG is already running."
 
+LOG_PHASE=checks
 check_old_hooks
 check_free_space
 
@@ -571,6 +630,7 @@ if (( ! DRY_RUN )); then
 fi
 
 # Pre actions may create sources such as the database dump directory.
+LOG_PHASE=checks
 (( ${#SOURCES[@]} > 0 )) || die "SOURCES is empty"
 for src in "${SOURCES[@]}"; do
     [[ $src == /* ]] || die "Source must be an absolute path: $src"

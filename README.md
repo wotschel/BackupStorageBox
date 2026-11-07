@@ -100,7 +100,7 @@ for the Storage Box (see below).
 | `EXCLUDES`    | Array of restic exclude patterns                  | empty   |
 | `RESTIC_FORGET_OPTS` | Array of `restic forget` policies, `()` = never delete | `--keep-daily 7 --keep-weekly 5 --keep-monthly 12` |
 | `WRAPPERS_DIR` | Local action directory; empty disables actions | `wrappers/` next to the resolved `backup.sh` |
-| `LOG_FILE`    | Log file                                          | `/dev/null` (sample: `/var/log/backup.log`) |
+| `LOG_FILE`    | Log file                                          | `/var/log/backup/backup.log` |
 | `MAIL_TO`     | Mail recipients (comma-separated), see "Mail"     | empty = no mails |
 | `MAIL_FROM`   | Sender address                                    | empty = mail system default |
 | `MIN_FREE_PERCENT` | Warn below this free space on the target, `0` = off | `5` |
@@ -203,6 +203,121 @@ lines and restic's error messages are still logged.
 
 Without a terminal (systemd, cron, output redirected) `-v` is ignored with a
 note, so the journal stays clean.
+
+## Logging
+
+The default log is `/var/log/backup/backup.log`, configurable through
+`LOG_FILE`. Existing configurations keep their configured path; change it
+explicitly to use the new default. `LOG_FILE="/dev/null"` disables file logging.
+New log directories and files are created with restrictive permissions
+(`700`/`600`); existing permissions are preserved. If the path cannot be
+created or written, a warning is emitted and output continues on the console.
+
+Every normal log line includes an ISO timestamp with timezone, severity,
+run ID and phase. Output from restic and local actions is preserved with an
+`OUTPUT` label; its severity is determined by the command's exit status.
+Console output remains available to cron or the systemd journal.
+
+```text
+2026-11-07T22:30:00+01:00 INFO [20261107T213000Z-12345] pre: Running pre action: /opt/backup/wrappers/pre/10-dump.sh
+2026-11-07T22:30:12+01:00 INFO [20261107T213000Z-12345] pre: Finished pre action: /opt/backup/wrappers/pre/10-dump.sh duration=12s exit=0
+2026-11-07T22:34:50+01:00 INFO [20261107T213000Z-12345] summary: finished status=OK duration=290s sources_ok=4 sources_failed=0 warnings=0 exit=0 dry_run=0
+```
+
+The start lists backup name, configuration and sources. Each action reports
+its duration and exit code. A single final summary follows all post actions,
+with `OK`, `WARNING` or `FAILED`, total duration and source counters. Sources
+with restic exit code 3 count under `sources_ok`, but produce `WARNING` and
+skip retention. Sources not attempted are not counted. Dry runs have
+`dry_run=1` and also write logs. Administrative commands do not create a
+backup log or a run summary.
+
+The script does not print password contents. Custom actions must avoid
+printing credentials, since their stdout and stderr are captured. With `-v`,
+restic's terminal progress and normal stdout remain terminal-only; action
+output, wrapper messages and restic stderr are logged.
+
+### Updating an existing installation
+
+A `git pull` updates the script but does not rewrite `/etc/backup/backup.conf`
+or install logrotate configuration. To switch an existing installation:
+
+1. Set `LOG_FILE="/var/log/backup/backup.log"` in the backup configuration
+   (or the configuration selected with `-c`).
+2. Install the rotation configuration as shown below. If another rotation rule
+   already targets this same file, replace it rather than defining it twice.
+3. Run `sudo /opt/backup/backup.sh -n` to verify logging without executing
+   pre/post actions or changing the remote backup. This still contacts the
+   repository and reads sources; it creates the log directory/file if needed.
+4. Inspect the log with `sudo tail -n 50 /var/log/backup/backup.log`.
+
+Old logs such as `/var/log/backup.log` remain in place and are not moved or
+covered by the new rotation rule. Keep or remove them separately as needed.
+
+### Reading logs and troubleshooting
+
+| Field | Meaning |
+|---|---|
+| `INFO` | Normal lifecycle and progress messages |
+| `WARN` | A warning; inspect the message and final status |
+| `ERROR` | A command or run failed |
+| `OUTPUT` | Captured command output, including ordinary messages and stderr |
+| Run ID | UTC start timestamp plus process ID, shared by all lines of a run |
+| Phase | `setup`, `checks`, `pre`, `backup`, `retention`, `post`, `summary` or `notify` |
+| `sources_ok` / `sources_failed` | Counts of attempted source backups, not pre/post actions |
+| `exit` | Exit code; action lines show that command's code, summary shows the overall code |
+
+```bash
+# Follow the log
+sudo tail -f /var/log/backup/backup.log
+
+# Find final results
+sudo grep -F 'summary: finished' /var/log/backup/backup.log
+
+# Select one run (replace the example ID with an ID from your log)
+sudo grep -F '[20261107T213000Z-12345]' /var/log/backup/backup.log
+
+# Read previous logs, including compressed archives
+sudo zcat -f /var/log/backup/backup.log.1 /var/log/backup/backup.log.2.gz
+```
+
+For a pre/post script, look for `Running ... action` and `Finished ... action`.
+An execute-permission warning includes the file path and a `chmod +x` command.
+No action messages are expected for a dry run, disabled actions
+(`WRAPPERS_DIR=""`), missing action directories or administrative commands.
+
+A final `WARNING` normally leaves the exit code at `0`; `FAILED` has a nonzero
+exit code. A failed post action makes an otherwise successful backup fail.
+Notification delivery happens after the summary and has its own `notify`
+messages; a mail delivery failure does not change the backup exit code.
+
+If file logging falls back to the console, check the configured path and its
+parent directory's permissions. For a systemd service, inspect
+`journalctl -u backup.service`; with cron, keep console output somewhere
+accessible until logging is working. Errors before configuration loading may
+only appear on the console.
+
+### Log rotation
+
+Install the supplied configuration for daily rotation, up to 30 archives,
+removal of archives older than 30 days, and compression (delayed by one
+rotation):
+
+```bash
+sudo install -m 644 /opt/backup/logrotate/backup /etc/logrotate.d/backup
+sudo logrotate --debug /etc/logrotate.d/backup
+```
+
+`--debug` validates and explains the rotation decision without rotating files.
+The supplied rule expects backups to run as root and creates new logs with
+mode `600`, owned by `root:root`.
+
+The machine must have logrotate installed and scheduled, as on a standard
+Ubuntu server. Adapt the path and owner in the rotation file when using a
+custom log location or a non-root backup user. No daemon restart is needed:
+the logger opens the current path for every line. A run crossing a rotation
+can span two files; notification excerpts select this run's ID from the
+current file and may omit lines already rotated away.
 
 ## Own steps before and after the backup
 

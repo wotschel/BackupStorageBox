@@ -17,3 +17,10 @@ Use absolute paths. See the main README for configuration and examples.
 Git ignores local actions, retaining only this guide and directory placeholders.
 They survive normal pulls but need their own backup; `git clean -fdx` removes
 them. Protect these directories and scripts from untrusted writers.
+
+Action stdout/stderr is captured in the configured backup log (default
+`/var/log/backup/backup.log`) and on the console. Each action has start/end
+messages with duration and exit code; all lines carry a run ID and `pre` or
+`post` phase. The final run summary follows post actions. Never print passwords
+or tokens from an action. See [Logging](../README.md#logging) for examples,
+troubleshooting and rotation setup.
