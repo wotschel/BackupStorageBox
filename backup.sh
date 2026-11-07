@@ -21,7 +21,7 @@ for d in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
 done
 export PATH
 
-readonly VERSION="5.2.0"
+readonly VERSION="5.3.0"
 readonly SCRIPT_DIR="$(dirname -- "$(realpath -- "$0")")"
 # Kept outside the script directory, so the repository can be updated or
 # re-cloned at any time without touching the configuration.
@@ -46,6 +46,8 @@ RUN_STARTED=0
 SOURCES_OK=0
 SOURCES_FAILED=0
 POST_PENDING=0
+STATUS_PENDING=0
+STATUS_FILE=""
 
 # --- Helpers -----------------------------------------------------------------
 
@@ -91,6 +93,25 @@ setup_logging() {
         LOG_FILE=/dev/null
         LOG_READY=1
         warn "Log file $requested is not writable; logging to the console only."
+    fi
+}
+
+# Publish only numeric monitoring data; never configuration or credentials.
+# Rename in the same directory keeps readers from seeing partial updates.
+write_status() {
+    local rc="$1" state=0 dir tmp
+    [[ -n $STATUS_FILE ]] || return 0
+    if (( rc != 0 )); then state=2
+    elif (( ${#WARNINGS[@]} > 0 )); then state=1
+    fi
+    dir="$(dirname -- "$STATUS_FILE")"
+    if ! mkdir -p -m 755 -- "$dir"; then return 1; fi
+    tmp="$(mktemp -- "$dir/.backup-status.XXXXXX")" || return 1
+    if ! printf '{"version":1,"state":%d,"finished_at":%d,"duration":%d,"exit_code":%d,"warnings":%d,"sources_ok":%d,"sources_failed":%d}\n' \
+        "$state" "$(date +%s)" "$SECONDS" "$rc" "${#WARNINGS[@]}" "$SOURCES_OK" "$SOURCES_FAILED" > "$tmp" \
+        || ! chmod 644 -- "$tmp" || ! mv -fT -- "$tmp" "$STATUS_FILE"; then
+        rm -f -- "$tmp"
+        return 1
     fi
 }
 
@@ -145,7 +166,7 @@ config_template() {
 # backup.conf – configuration for backup.sh (sourced as Bash)
 
 # --- Target server: Hetzner Storage Box ---
-REMOTE_USER="u712238"           # Storage Box user
+REMOTE_USER="YOUR_STORAGEBOX_USER"           # replace with your Storage Box user
 REMOTE_HOST="${REMOTE_USER}.your-storagebox.de"
 SSH_PORT=23                     # Storage Box SSH/SFTP port
 SSH_KEY="/root/.ssh/backup_ed25519"   # empty = ssh default key (path without spaces)
@@ -191,6 +212,10 @@ RESTIC_FORGET_OPTS=(--keep-daily 7 --keep-weekly 5 --keep-monthly 12)
 
 # --- Log file ---
 LOG_FILE="/var/log/backup/backup.log"
+
+# --- Monitoring (numeric status only, readable by the monitoring user) ---
+# One file per backup configuration. Empty = disable status publishing.
+STATUS_FILE="/var/lib/backup/status.json"
 
 # --- Notifications ---
 # Mail to MAIL_TO (comma-separated) when the backup fails or has warnings,
@@ -305,6 +330,10 @@ on_exit() {
         local post_rc=0
         run_actions post "$rc" || post_rc=$?
         (( rc == 0 && post_rc != 0 )) && rc=$post_rc
+    fi
+    if (( STATUS_PENDING )); then
+        LOG_PHASE=monitoring
+        write_status "$rc" || warn "Could not publish monitoring status: $STATUS_FILE"
     fi
     if (( RUN_STARTED )); then
         local status=OK level=INFO
@@ -443,6 +472,7 @@ REMOTE_BASE=""; BACKUP_NAME="$(hostname -s)"
 SOURCES=(); EXCLUDES=()
 WRAPPERS_DIR="$SCRIPT_DIR/wrappers"
 LOG_FILE="/var/log/backup/backup.log"
+STATUS_FILE="/var/lib/backup/status.json"
 RESTIC_REPO_PATH=""
 RESTIC_PASSWORD_FILE="/etc/backup/restic.pass"
 RESTIC_FORGET_OPTS=(--keep-daily 7 --keep-weekly 5 --keep-monthly 12)
@@ -466,6 +496,13 @@ trap on_exit EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+if (( ! RESTIC_PASSTHRU && ! TEST_MAIL )); then
+    # Hold the configuration lock through cleanup and atomic status publication.
+    exec 9<"$CONFIG"
+    flock -n 9 || die "A backup with $CONFIG is already running."
+    (( DRY_RUN )) || STATUS_PENDING=1
+fi
 
 [[ $BACKUP_METHOD == restic ]] || die "BACKUP_METHOD=\"$BACKUP_METHOD\" is no longer supported – since 4.0.0 \
 only restic is available. Remove BACKUP_METHOD from $CONFIG and set up restic (see README)."
@@ -612,12 +649,6 @@ if (( PROGRESS )) && [[ ! -t 1 ]]; then
     log "Note: -v needs a terminal – progress display disabled."
     PROGRESS=0
 fi
-
-# Only one instance per configuration at a time. The lock is held on the
-# configuration file itself (opened read-only), so no lock file is needed –
-# a lock file in /tmp breaks when another user created it (fs.protected_regular).
-exec 9<"$CONFIG"
-flock -n 9 || die "A backup with $CONFIG is already running."
 
 LOG_PHASE=checks
 check_old_hooks

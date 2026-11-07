@@ -54,10 +54,12 @@ lives separately in `/etc/backup/`. Updating is therefore just a `git pull`,
 and the repository can be deleted and cloned again at any time without losing
 the configuration.
 
+Replace `YOUR_STORAGEBOX_USER` below with your Storage Box username.
+
 ```bash
 # 1. Create an SSH key for the backup and deploy it to the Storage Box
 sudo ssh-keygen -t ed25519 -f /root/.ssh/backup_ed25519 -N ""
-sudo ssh-copy-id -p 23 -s -i /root/.ssh/backup_ed25519 u712238@u712238.your-storagebox.de
+sudo ssh-copy-id -p 23 -s -i /root/.ssh/backup_ed25519 YOUR_STORAGEBOX_USER@YOUR_STORAGEBOX_USER.your-storagebox.de
 
 # 2. Clone the repository and link the script
 sudo git clone https://github.com/wotschel/BackupStorageBox.git /opt/backup
@@ -100,6 +102,7 @@ for the Storage Box (see below).
 | `EXCLUDES`    | Array of restic exclude patterns                  | empty   |
 | `RESTIC_FORGET_OPTS` | Array of `restic forget` policies, `()` = never delete | `--keep-daily 7 --keep-weekly 5 --keep-monthly 12` |
 | `WRAPPERS_DIR` | Local action directory; empty disables actions | `wrappers/` next to the resolved `backup.sh` |
+| `STATUS_FILE` | Numeric monitoring status; empty disables publishing | `/var/lib/backup/status.json` |
 | `LOG_FILE`    | Log file                                          | `/var/log/backup/backup.log` |
 | `MAIL_TO`     | Mail recipients (comma-separated), see "Mail"     | empty = no mails |
 | `MAIL_FROM`   | Sender address                                    | empty = mail system default |
@@ -132,27 +135,31 @@ separate per `BACKUP_NAME`.
 
 ### Hetzner Storage Box
 
+Replace `YOUR_STORAGEBOX_USER` and `YOUR_STORAGEBOX_SUBACCOUNT` in the examples
+with your own account details before running commands or using the configuration.
+
 The sample configuration from `--init-config` is already set up for the
-Storage Box `u712238` (port 23, key `/root/.ssh/backup_ed25519`). The host is
+Storage Box (port 23, key `/root/.ssh/backup_ed25519`), using the placeholder
+`YOUR_STORAGEBOX_USER`. The host is
 derived from `REMOTE_USER`:
 
 ```bash
-REMOTE_USER="u712238"
+REMOTE_USER="YOUR_STORAGEBOX_USER"
 REMOTE_HOST="${REMOTE_USER}.your-storagebox.de"
 SSH_PORT=23
 ```
 
 SSH support must be enabled in the Hetzner Console. Deploy the key with
-`ssh-copy-id -p 23 -s u712238@u712238.your-storagebox.de` (`-s` uses SFTP,
+`ssh-copy-id -p 23 -s YOUR_STORAGEBOX_USER@YOUR_STORAGEBOX_USER.your-storagebox.de` (`-s` uses SFTP,
 because the box has no shell).
 
 To keep machines apart, give each one its own sub-account
-(`u712238-sub1`, ...) with its own key. Its home then only contains that
+(`YOUR_STORAGEBOX_SUBACCOUNT`, ...) with its own key. Its home then only contains that
 machine's repository, so it can live directly in the home:
 
 ```bash
-REMOTE_USER="u712238-sub1"
-SSH_KEY="/root/.ssh/backup_sv32_ed25519"
+REMOTE_USER="YOUR_STORAGEBOX_SUBACCOUNT"
+SSH_KEY="/root/.ssh/backup_server_ed25519"
 RESTIC_REPO_PATH="."
 ```
 
@@ -263,7 +270,7 @@ covered by the new rotation rule. Keep or remove them separately as needed.
 | `ERROR` | A command or run failed |
 | `OUTPUT` | Captured command output, including ordinary messages and stderr |
 | Run ID | UTC start timestamp plus process ID, shared by all lines of a run |
-| Phase | `setup`, `checks`, `pre`, `backup`, `retention`, `post`, `summary` or `notify` |
+| Phase | `setup`, `checks`, `pre`, `backup`, `retention`, `post`, `monitoring`, `summary` or `notify` |
 | `sources_ok` / `sources_failed` | Counts of attempted source backups, not pre/post actions |
 | `exit` | Exit code; action lines show that command's code, summary shows the overall code |
 
@@ -419,7 +426,7 @@ a successful run without warnings neither.
 
 ```bash
 MAIL_TO="admin@example.org, ops@example.org"
-MAIL_FROM="backup@sv32.example.org"
+MAIL_FROM="backup@server.example.org"
 MIN_FREE_PERCENT=5
 ```
 
@@ -443,6 +450,98 @@ reports its quota there. The log shows e.g.
 `MIN_FREE_PERCENT` this becomes a warning (and a mail); the backup still
 runs. If the server does not support `df` in sftp, only a note is logged.
 Storage Box snapshots count towards the quota as well.
+
+## Nagios monitoring
+
+`backup.sh` publishes the result of each real run to
+`/var/lib/backup/status.json`. The [Nagios-compatible check](monitoring/check_backup.py)
+reads that file locally; it does not need repository access, passwords or root
+privileges. It requires Python 3 and can be run by NRPE or another existing
+monitoring agent.
+
+| Exit code | Nagios state | Meaning |
+|---|---|---|
+| `0` | `OK` | Last backup completed without warnings and is recent |
+| `1` | `WARNING` | Last backup had warnings, or completion is over 30 hours old |
+| `2` | `CRITICAL` | Last backup failed, no result exists, or completion is over 36 hours old |
+| `3` | `UNKNOWN` | Status cannot be read, is invalid, or the check arguments/clock are invalid |
+
+A failed pre action, backup or post action produces `CRITICAL` after cleanup
+finishes. Restic exit code 3 (unreadable files), a failed retention command,
+or skipped non-executable actions produce `WARNING`. A recorded failure takes
+priority over age thresholds. Status codes and performance data follow the
+[Nagios plugin conventions](https://nagios-plugins.org/doc/guidelines.html).
+
+### Install and test the check
+
+On the backup machine:
+
+```bash
+sudo install -D -m 755 /opt/backup/monitoring/check_backup.py /usr/local/lib/nagios/plugins/check_backup
+/usr/local/lib/nagios/plugins/check_backup
+```
+
+The first check is `CRITICAL` until a real backup has finished with this
+version of the script; `backup.sh -n` does not create monitoring status.
+After a real run, test with the user running your monitoring agent (often
+`nagios`; adapt the username to your setup):
+
+```bash
+sudo -u nagios /usr/local/lib/nagios/plugins/check_backup
+```
+
+The status file has mode `644` and contains only numeric status, completion
+time, duration, exit code, warning count and source counts. New status
+directories have mode `755`; existing directory permissions are not changed.
+If the agent gets `UNKNOWN`, check that it can traverse every parent directory
+and read the file. Keep the directory writable only by the backup owner; do
+not give the agent write permission or access to the backup configuration.
+
+### Connect to an existing NRPE setup
+
+Add the command from [`monitoring/nrpe.cfg.example`](monitoring/nrpe.cfg.example)
+to the NRPE configuration on the backup machine:
+
+```ini
+command[check_restic_backup]=/usr/local/lib/nagios/plugins/check_backup -f /var/lib/backup/status.json -w 108000 -c 129600
+```
+
+Reload or restart your NRPE service after editing its configuration. On the
+Nagios server, configure the backup service to invoke the existing NRPE check
+with command name `check_restic_backup` and your normal notification settings.
+The example does not install NRPE, change its network access rules or configure
+the Nagios server. A check interval of five minutes is a reasonable starting
+point; notification timing also depends on Nagios retries and notification rules.
+
+### Configure paths and age limits
+
+For several backup configurations on one machine, give **each** a separate
+status path in its `backup.conf` and a matching monitoring check:
+
+```bash
+STATUS_FILE="/var/lib/backup/home-status.json"
+# STATUS_FILE=""  # disable monitoring status publishing
+```
+
+Age limits are seconds since the last completion. Adapt them to your schedule
+and expected runtime; the default 30/36-hour limits allow margin for daily runs:
+
+```bash
+/usr/local/lib/nagios/plugins/check_backup -f /var/lib/backup/home-status.json -w 108000 -c 129600
+```
+
+Results are published atomically after all post actions and before the final
+log summary. Dry runs, administrative commands and rejected concurrent runs
+leave the previous result untouched. While a backup is running, the check
+continues to report the previous completed run. A failure stays critical until
+a later run replaces it with a successful or warning result.
+
+Errors before the configuration is loaded, power loss and SIGKILL cannot
+publish a new result; the age check eventually detects the missing completion.
+An inability to write status is logged as a warning and leaves the old result
+in place. The check reports completion health, not whether a restore or a full
+repository integrity check has succeeded. No logs or credential files are
+parsed or executed by the monitoring check.
 
 ## Running daily (systemd timer)
 

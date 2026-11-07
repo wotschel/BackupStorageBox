@@ -1,5 +1,6 @@
 """Regression checks using a fake restic; never contact a backup server."""
 import os
+import json
 import fcntl
 import re
 import stat
@@ -39,6 +40,7 @@ RESTIC_PASSWORD_FILE='{self.password}'
 MIN_FREE_PERCENT=0
 LOG_FILE='{log_file}'
 WRAPPERS_DIR='{self.base / 'wrappers'}'
+STATUS_FILE='{self.base / 'status.json'}'
 {config_extra}
 ''')
         return subprocess.run(['bash', str(ROOT / 'backup.sh'), '-c',
@@ -228,12 +230,79 @@ WRAPPERS_DIR='{self.base / 'wrappers'}'
         self.assertNotIn('old-run-secret-marker', mail)
         self.assertNotIn('test-only', mail)
 
+    def test_status_file_covers_backup_and_post_failures(self):
+        for backup_rc, expected in [(0, 0), (3, 1), (2, 2)]:
+            with self.subTest(backup_rc=backup_rc):
+                result = self.run_backup(self.base, rc=backup_rc)
+                status_file = self.base / 'status.json'
+                data = json.loads(status_file.read_text())
+                self.assertEqual(data['state'], expected)
+                self.assertEqual(data['exit_code'], result.returncode)
+                self.assertEqual(stat.S_IMODE(status_file.stat().st_mode), 0o644)
+                check = subprocess.run(['python3', str(ROOT / 'monitoring/check_backup.py'),
+                                        '-f', str(status_file)], capture_output=True, text=True)
+                self.assertEqual(check.returncode, expected, check.stdout + check.stderr)
+                self.assertNotIn('test-only', status_file.read_text())
+        self.action('post', '10-fail', 'exit 9')
+        self.run_backup(self.base)
+        self.assertEqual(json.loads((self.base / 'status.json').read_text())['state'], 2)
+
+    def test_status_is_preserved_by_dry_run_admin_and_lock_rejection(self):
+        status_file = self.base / 'status.json'
+        status_file.write_text('previous status')
+        for args in [('-n',), ('--restic', 'snapshots')]:
+            self.run_backup(self.base, *args)
+            self.assertEqual(status_file.read_text(), 'previous status')
+        with self.config.open() as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.run_backup(self.base)
+        self.assertEqual(status_file.read_text(), 'previous status')
+
+    def test_missing_source_and_pre_failure_publish_critical(self):
+        self.run_backup(self.base / 'missing')
+        status_file = self.base / 'status.json'
+        self.assertEqual(json.loads(status_file.read_text())['state'], 2)
+        self.action('pre', '10-fail', 'exit 8')
+        self.run_backup(self.base)
+        self.assertEqual(json.loads(status_file.read_text())['state'], 2)
+
+    def test_status_write_failure_warns_and_does_not_leave_temporary_file(self):
+        blocker = self.base / 'blocker'
+        blocker.write_text('not a directory')
+        result = self.run_backup(self.base, config_extra=f'STATUS_FILE="{blocker}/status.json"')
+        self.assertEqual(result.returncode, 0)
+        self.assertIn('Could not publish monitoring status', result.stdout)
+        self.assertIn('summary: finished status=WARNING', result.stdout)
+        self.assertEqual(list(self.base.glob('.backup-status.*')), [])
+
+    def test_status_destination_directory_is_rejected_without_temp_leaks(self):
+        destination = self.base / 'destination'
+        destination.mkdir()
+        result = self.run_backup(self.base, config_extra=f'STATUS_FILE="{destination}"')
+        self.assertEqual(result.returncode, 0)
+        self.assertIn('Could not publish monitoring status', result.stdout)
+        self.assertEqual(list(destination.iterdir()), [])
+        self.assertEqual(list(self.base.glob('.backup-status.*')), [])
+
+    def test_dependency_setup_failure_publishes_critical(self):
+        self.run_backup(self.base, config_extra=f'RESTIC_PASSWORD_FILE="{self.base}/missing-password"')
+        data = json.loads((self.base / 'status.json').read_text())
+        self.assertEqual(data['state'], 2)
+        self.assertEqual(data['exit_code'], 1)
+
+    def test_status_publishing_can_be_disabled(self):
+        self.run_backup(self.base, config_extra='STATUS_FILE=""')
+        self.assertFalse((self.base / 'status.json').exists())
+
     def test_signal_runs_post(self):
         self.action('pre', '10-signal', 'kill -TERM "$PPID"')
         self.action('post', '10-cleanup', 'echo post:$BACKUP_EXIT_CODE >> "$CALLS"')
         result = self.run_backup(self.base)
         self.assertEqual(result.returncode, 143, result.stdout + result.stderr)
         self.assertEqual(self.calls.read_text().splitlines(), ['post:143'])
+        data = json.loads((self.base / 'status.json').read_text())
+        self.assertEqual(data['state'], 2)
+        self.assertEqual(data['exit_code'], 143)
 
     def test_lock_rejection_does_not_run_actions(self):
         self.action('pre', '10-action', 'echo unexpected >> "$CALLS"')

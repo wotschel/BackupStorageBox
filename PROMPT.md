@@ -80,6 +80,16 @@ Requirements:
   catch-up. Service runs `/opt/backup/backup.sh`, logs to the journal, has no
   startup time limit and allows five minutes to stop. Document installation,
   verification, schedule/config overrides, updates and disabling the timer.
+- Publish atomic numeric JSON status after cleanup for each real run to
+  STATUS_FILE (default `/var/lib/backup/status.json`, empty disables), with
+  mode 644 and newly created status directory mode 755. Hold the configuration
+  lock until status publication; dry runs/admin commands and rejected concurrent
+  runs must not overwrite previous status. Provide a Python 3 Nagios check
+  with standard exit codes, 30h warning/36h critical age thresholds by default,
+  performance data and an NRPE example. Missing status is critical; invalid or
+  unreadable status is unknown. Never source status files or include credentials.
+- Use explicit placeholders for personal usernames and hosts in documentation
+  and sample configurations; do not embed real account details.
 - All output, comments and documentation in English.
 
 Also provide README.md (how it works, setup, configuration, local actions, mail,

@@ -1,0 +1,4 @@
+# Add to the existing NRPE configuration on the backup machine.
+# Install monitoring/check_backup.py as /usr/local/lib/nagios/plugins/check_backup.
+# Age thresholds are seconds: warning after 30h, critical after 36h.
+command[check_restic_backup]=/usr/local/lib/nagios/plugins/check_backup -f /var/lib/backup/status.json -w 108000 -c 129600

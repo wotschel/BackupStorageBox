@@ -6,6 +6,10 @@ versioning according to [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Atomic numeric monitoring status after real backups, including pre/post
+  failures; configurable `STATUS_FILE` with read access for monitoring agents.
+- Nagios-compatible Python check with failure/warning states, stale backup
+  thresholds, performance data and an NRPE command example.
 - Installable systemd service/timer in `units/`, with scheduling, drop-in
   customization, update and troubleshooting instructions.
 - Structured logging with ISO timestamps, severity, unique run IDs and phases,
@@ -14,6 +18,8 @@ versioning according to [SemVer](https://semver.org/).
 - Daily logrotate configuration with 30 archives, max age 30 days and compression.
 
 ### Changed
+- Replace personal Storage Box account details and machine names in examples
+  with explicit placeholders.
 - Default log path is `/var/log/backup/backup.log`; new files/directories use
   restrictive permissions. Existing configured paths remain supported.
 - Mail excerpts select the run ID instead of byte offsets in a shared log.
@@ -250,7 +256,7 @@ versioning according to [SemVer](https://semver.org/).
   `backup.sh` into `/usr/local/sbin`
 - Sample configuration from `--init-config` is preset for the Hetzner Storage
   Box (port 23, `REMOTE_BASE="."`, `RSYNC_OPTS` without `-A`/`-X`, key
-  `/root/.ssh/backup_ed25519`) with user `u712238`; `REMOTE_HOST` is derived
+  `/root/.ssh/backup_ed25519`) with user `YOUR_STORAGEBOX_USER`; `REMOTE_HOST` is derived
   from `REMOTE_USER`
 
 ## [2.0.0] – 2026-11-07
