@@ -3,6 +3,12 @@
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 versioning according to [SemVer](https://semver.org/).
 
+## [3.6.1] – 2026-11-07
+
+### Changed
+- The sample configuration from `--init-config` also backs up `/opt`
+  (existing configurations are not changed)
+
 ## [3.6.0] – 2026-11-07
 
 ### Added

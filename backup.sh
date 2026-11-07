@@ -20,7 +20,7 @@
 #
 set -euo pipefail
 
-readonly VERSION="3.6.0"
+readonly VERSION="3.6.1"
 # Kept outside the script directory, so the repository can be updated or
 # re-cloned at any time without touching the configuration.
 readonly DEFAULT_CONFIG="/etc/backup/backup.conf"
@@ -134,6 +134,7 @@ BACKUP_NAME="$(hostname -s)"
 SOURCES=(
     "/etc"
     "/home"
+    "/opt"
     "/root"
 )
 
