@@ -6,16 +6,15 @@
 # (default restic-<BACKUP_NAME> in the home of the SSH user), one snapshot
 # per source, staggered retention via "restic forget --prune".
 #
-# Hooks: executable files in <HOOKS_DIR>/pre.d run before the backup (e.g.
-# database dumps, maintenance mode on), those in <HOOKS_DIR>/post.d afterwards
-# – always, even if the backup failed or was interrupted.
+# Steps before and after the backup (database dump, maintenance mode) belong
+# in a wrapper script that calls this one, e.g. nextcloud-backup.sh.
 #
 # Mail (MAIL_TO): on failure, on warnings, and when the target has less than
 # MIN_FREE_PERCENT free space before the backup.
 #
 set -euo pipefail
 
-readonly VERSION="4.0.0"
+readonly VERSION="5.0.0"
 # Kept outside the script directory, so the repository can be updated or
 # re-cloned at any time without touching the configuration.
 readonly DEFAULT_CONFIG="/etc/backup/backup.conf"
@@ -28,7 +27,6 @@ INIT_TARGET=""
 RESTIC_PASSTHRU=0
 RESTIC_PASSTHRU_ARGS=()
 LOG_FILE="/dev/null"
-POST_HOOKS_PENDING=0
 TEST_MAIL=0
 LAST_ERROR=""
 WARNINGS=()
@@ -142,16 +140,6 @@ RESTIC_FORGET_OPTS=(--keep-daily 7 --keep-weekly 5 --keep-monthly 12)
 # --- Log file ---
 LOG_FILE="/var/log/backup.log"
 
-# --- Hooks ---
-# Executable files in <HOOKS_DIR>/pre.d run before the backup, those in
-# <HOOKS_DIR>/post.d afterwards, each in lexical order (10-..., 20-...).
-# A failing pre hook aborts the backup; post hooks ALWAYS run once the pre
-# phase has started (also after errors or Ctrl+C), e.g. to end a maintenance
-# mode. They get BACKUP_RESULT=success|failure and BACKUP_EXIT_CODE.
-# Default: the "hooks" folder next to this configuration file.
-#HOOKS_DIR="/etc/backup/hooks"
-HOOK_TIMEOUT=3600               # seconds per hook, 0 = no limit
-
 # --- Notifications ---
 # Mail to MAIL_TO (comma-separated) when the backup fails or has warnings,
 # e.g. less than MIN_FREE_PERCENT free space on the target before the backup.
@@ -254,106 +242,26 @@ notify() {
     } | send_mail "[backup] $status: $BACKUP_NAME ($(date +%F))"
 }
 
-# =============================================================================
-# Hooks
-# =============================================================================
-
-# Runs the executable files in <HOOKS_DIR>/<PHASE>.d in lexical order, output
-# goes to the log. Phase "pre" stops at the first failing hook, phase "post"
-# runs all of them. Returns 1 if a hook failed. A dry run only lists them.
-# Usage: run_hooks pre|post
-run_hooks() {
-    local phase="$1" dir="${HOOKS_DIR%/}/$1.d"
-    local hook name rc owner perms failed=0
-    local -a hooks=()
-    [[ -d $dir ]] || return 0
-
-    for hook in "$dir"/*; do               # hidden files are not matched
-        [[ -f $hook ]] || continue
-        name="${hook##*/}"
-        case $name in *~|*.bak|*.disabled|*.dpkg-*|*.swp) continue ;; esac
-        if [[ ! -x $hook ]]; then
-            log "Hook $phase.d/$name skipped (not executable)."
-            continue
-        fi
-        hooks+=("$hook")
-    done
-    (( ${#hooks[@]} > 0 )) || return 0
-
-    export BACKUP_PHASE="$phase" BACKUP_NAME
-    export BACKUP_CONFIG="$CONFIG" BACKUP_LOG_FILE="$LOG_FILE"
-
-    for hook in "${hooks[@]}"; do
-        name="$phase.d/${hook##*/}"
-        if (( DRY_RUN )); then
-            log "Dry run: would run hook $name"
-            continue
-        fi
-        # Hooks run as root: refuse files others could have changed
-        if (( EUID == 0 )); then
-            read -r owner perms < <(stat -c '%u %a' -- "$hook")
-            if (( owner != 0 || (8#$perms & 8#022) )); then
-                log "ERROR: hook $name is not owned by root or writable by group/others – not run."
-                failed=1
-                [[ $phase == pre ]] && break
-                continue
-            fi
-        fi
-        log "Running hook $name ..."
-        set +e
-        if (( HOOK_TIMEOUT > 0 )); then
-            timeout -k 30 "$HOOK_TIMEOUT" "$hook" </dev/null 2>&1 | tee -a "$LOG_FILE"
-        else
-            "$hook" </dev/null 2>&1 | tee -a "$LOG_FILE"
-        fi
-        rc=${PIPESTATUS[0]}
-        set -e
-        case $rc in
-            0)       log "Hook $name done." ;;
-            124|137) log "ERROR: hook $name timed out after ${HOOK_TIMEOUT}s."; failed=1 ;;
-            *)       log "ERROR: hook $name failed (exit code $rc)."; failed=1 ;;
-        esac
-        (( failed )) && [[ $phase == pre ]] && break
-    done
-    return "$failed"
-}
-
-# Creates <HOOKS_DIR>/pre.d and post.d if missing (not in a dry run). Failing
-# to create them is no error – without folders there are simply no hooks.
-ensure_hook_dirs() {
-    local d missing=()
-    (( DRY_RUN )) && return 0
-    for d in "${HOOKS_DIR%/}/pre.d" "${HOOKS_DIR%/}/post.d"; do
-        [[ -d $d ]] || missing+=("$d")
-    done
-    (( ${#missing[@]} > 0 )) || return 0
-    if mkdir -p -m 755 -- "${missing[@]}" 2>/dev/null; then
-        log "Created hook folders: ${missing[*]}"
-    else
-        log "Note: could not create hook folders under $HOOKS_DIR – running without hooks."
-    fi
-}
-
-# EXIT trap: runs the post hooks (if the pre phase was reached), sends the
-# notification mail. A failing post hook turns a successful run
-# into exit code 1.
+# EXIT trap: sends the notification mail if the run failed or had warnings
 on_exit() {
     local rc=$?
     trap - EXIT
     set +e
-    if (( POST_HOOKS_PENDING )); then
-        POST_HOOKS_PENDING=0
-        export BACKUP_EXIT_CODE="$rc" BACKUP_RESULT="success"
-        (( rc == 0 )) || BACKUP_RESULT="failure"
-        if ! run_hooks post; then
-            LAST_ERROR="${LAST_ERROR:+$LAST_ERROR; }A post-backup hook failed – check the services it should have restored!"
-            log "ERROR: a post-backup hook failed – check the services it should have restored!"
-            (( rc == 0 )) && rc=1
-        fi
-        set +e   # run_hooks switches errexit back on
-    fi
     notify "$rc"
     exit "$rc"
+}
+
+# Hooks were removed in 5.0.0. Installed ones would silently no longer run
+# (e.g. no database dump), so point them out.
+check_old_hooks() {
+    local dir f
+    dir="$(dirname -- "$CONFIG")/hooks"
+    for f in "$dir"/pre.d/* "$dir"/post.d/*; do
+        if [[ -f $f ]]; then
+            warn "Hooks are no longer supported since 5.0.0 – $dir is NOT run. Use a wrapper script (e.g. nextcloud-backup.sh) and delete $dir."
+            return 0
+        fi
+    done
 }
 
 # --- Arguments ---------------------------------------------------------------
@@ -399,9 +307,6 @@ if (( INIT_CONFIG )); then
     config_template > "$target"
     chmod 600 "$target"
     echo "Sample configuration written: $target"
-    if mkdir -p "$dir/hooks/pre.d" "$dir/hooks/post.d" 2>/dev/null; then
-        echo "Hook folders: $dir/hooks/pre.d and $dir/hooks/post.d"
-    fi
     echo "Note: mode 600 – view/edit with sudo, e.g. sudo nano $target"
     exit 0
 fi
@@ -417,8 +322,6 @@ SOURCES=(); EXCLUDES=()
 RESTIC_REPO_PATH=""
 RESTIC_PASSWORD_FILE="/etc/backup/restic.pass"
 RESTIC_FORGET_OPTS=(--keep-daily 7 --keep-weekly 5 --keep-monthly 12)
-HOOKS_DIR="$(dirname -- "$CONFIG")/hooks"
-HOOK_TIMEOUT=3600
 MAIL_TO=""; MAIL_FROM=""; MIN_FREE_PERCENT=5
 
 # shellcheck source=/dev/null
@@ -431,8 +334,8 @@ fi
 # Start of this run in the log, for the excerpt in the notification mail
 LOG_START=$(stat -c %s -- "$LOG_FILE" 2>/dev/null || echo 0)
 
-# From here on errors are reported by mail; the post hooks run once the pre
-# phase has been reached. The signal traps exit, which triggers the EXIT trap.
+# From here on errors are reported by mail. The signal traps exit, which
+# triggers the EXIT trap.
 trap on_exit EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
@@ -444,7 +347,6 @@ only restic is available. Remove BACKUP_METHOD from $CONFIG and set up restic (s
 [[ -n $REMOTE_HOST ]]          || die "REMOTE_HOST is missing in $CONFIG"
 [[ -n $BACKUP_NAME ]]          || die "BACKUP_NAME is missing in $CONFIG"
 (( ${#SOURCES[@]} > 0 ))       || die "SOURCES is empty"
-[[ $HOOK_TIMEOUT =~ ^[0-9]+$ ]] || die "HOOK_TIMEOUT must be an integer"
 [[ $MIN_FREE_PERCENT =~ ^[0-9]+$ ]] && (( MIN_FREE_PERCENT <= 100 )) \
                                || die "MIN_FREE_PERCENT must be an integer from 0 to 100"
 for src in "${SOURCES[@]}"; do
@@ -596,11 +498,6 @@ fi
 exec 9<"$CONFIG"
 flock -n 9 || die "A backup with $CONFIG is already running."
 
+check_old_hooks
 check_free_space
-
-# From here on the post hooks always run, also on errors and signals
-POST_HOOKS_PENDING=1
-ensure_hook_dirs
-run_hooks pre || die "A pre-backup hook failed – backup aborted (post-backup hooks still run)."
-
 backup_restic

@@ -45,39 +45,34 @@ Requirements:
   `BACKUP_METHOD` is set to anything but `restic` (the rsync method was
   removed in 4.0.0); still honour `REMOTE_BASE` for the default repository
   path; `--restore-perms` explains how to use `setfacl --restore` instead.
-- Pre and post hooks: run the executable files in `<HOOKS_DIR>/pre.d/`
-  before and in `<HOOKS_DIR>/post.d/` after the backup, in lexical order,
-  output to the log (`HOOKS_DIR` default: `hooks` next to the configuration
-  file; `--init-config` and every backup run create missing folders). A failing pre hook aborts
-  the backup; post hooks always run once the pre phase has started, also on
-  errors and signals (EXIT trap), with `BACKUP_RESULT` and
-  `BACKUP_EXIT_CODE` in the environment, and a failing post hook makes the
-  run fail. Per-hook timeout `HOOK_TIMEOUT` (default 3600 s); as root, refuse
-  hooks not owned by root or writable by group/others; skip non-executable
-  files with a note; in a dry run only list the hooks.
 - Mail notification via `sendmail` to `MAIL_TO` (optional `MAIL_FROM`):
-  `FAILED` on any error exit (also configuration errors, hooks, signals),
+  `FAILED` on any error exit (also configuration errors, signals),
   `WARNING` if a successful run collected warnings; body with error,
   warnings and the log of this run (last 200 lines); none in a dry run;
   `--test-mail` sends a test mail. Before the backup, check the free space
   on the target with `df` in sftp (no shell needed) and warn below
   `MIN_FREE_PERCENT` (default 5, 0 = off); if `df` fails, only log a note.
-- Ready-made hooks in the repository: `hooks/pre.d/10-nextcloud` and
-  `hooks/post.d/90-nextcloud`. The pre hook detects the installation
-  (folder with `occ`), its user (owner of `config/config.php`) and the PHP
-  version the web server uses (running php-fpm, Apache mod_php, FPM sockets
-  in the web server configuration; verified with `occ status`, falling back
-  to other installed versions), enables maintenance mode and dumps the
-  database with the credentials from the Nextcloud configuration
-  (MySQL/MariaDB via a temporary option file, PostgreSQL, SQLite) to
-  `/var/backups/nextcloud` (`.tmp` + `mv`). It warns if the config, data or
-  dump folder is missing from `SOURCES` and has a `--check` mode. The post
-  hook always ends maintenance mode (also if it was on before), using the
-  installation, user and PHP binary the pre hook stored in a state file in
-  `/var/lib/backup`. Optional overrides in
-  `/etc/backup/nextcloud.conf`.
+- No hooks: steps before and after the backup belong in a wrapper script.
+  If `<config dir>/hooks/pre.d` or `post.d` still contain files (hooks of
+  versions 3.4–4.x), warn so they are not silently ignored.
+- Wrapper `nextcloud-backup.sh [--check] [backup.sh options]` next to
+  `backup.sh`: detect the installation (folder with `occ`), its user (owner
+  of `config/config.php`) and the PHP version the web server uses (running
+  php-fpm, Apache mod_php, FPM sockets in the web server configuration;
+  verified with `occ status`, falling back to other installed versions);
+  enable maintenance mode, dump the database with the credentials from the
+  Nextcloud configuration (MySQL/MariaDB via a temporary option file,
+  PostgreSQL, SQLite) to `/var/backups/nextcloud` (`.tmp` + `mv`), run
+  `backup.sh` with the given options, and always end maintenance mode in an
+  EXIT trap (also on signals and if it was on before). Warn if the config,
+  data or dump folder is missing from `SOURCES`. `-n`: no maintenance mode
+  and no dump, `backup.sh -n`. Mail to `MAIL_TO` of the backup
+  configuration on failures before the backup, when maintenance mode could
+  not be ended, and on warnings – not on failures of `backup.sh`, which
+  mails them itself. Optional overrides in `nextcloud.conf` next to the
+  backup configuration.
 - All output, comments and documentation in English.
 
-Also provide README.md (how it works, setup, configuration, hooks, mail,
+Also provide README.md (how it works, setup, configuration, Nextcloud, mail,
 systemd timer, restoring), CHANGELOG.md and this PROMPT.md in the repository
 `BackupStorageBox`.

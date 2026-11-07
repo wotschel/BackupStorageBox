@@ -3,6 +3,31 @@
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 versioning according to [SemVer](https://semver.org/).
 
+## [5.0.0] – 2026-11-07
+
+### Removed
+- **Hooks** (`pre.d/`, `post.d/`, `HOOKS_DIR`, `HOOK_TIMEOUT`, the hook
+  folders created by `--init-config` and the first run) and the ready-made
+  hooks in `hooks/`. Steps before and after the backup now belong in a
+  wrapper script; `backup.sh` is down to about 500 lines
+
+### Added
+- `nextcloud-backup.sh`: wrapper replacing the Nextcloud hooks – same
+  detection (installation, user, PHP version, database), maintenance mode
+  on, database dump, `backup.sh` with all given options, maintenance mode
+  always off in an EXIT trap. `--check` shows the detection, `-n` is a dry
+  run without maintenance mode and dump. Mails failures before the backup,
+  a maintenance mode that could not be ended, and warnings
+- Warning (and mail) if the old hook folders still contain files, so they
+  are not silently ignored
+
+### Migration
+- Delete `/etc/backup/hooks/` and run `nextcloud-backup.sh` instead of
+  `backup.sh` (systemd: `ExecStart=/opt/backup/nextcloud-backup.sh`);
+  `/etc/backup/nextcloud.conf` keeps working
+- The state file `/var/lib/backup/nextcloud.state` is no longer used and
+  can be deleted
+
 ## [4.0.0] – 2026-11-07
 
 ### Removed

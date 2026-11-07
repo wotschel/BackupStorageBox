@@ -8,8 +8,8 @@ over SFTP to a remote server, preset for the Hetzner Storage Box:
 - one snapshot per source, owners, groups, permissions, ACLs and extended
   attributes included
 - **staggered retention**: 7 daily, 5 weekly, 12 monthly snapshots
-- **hooks** before and after the backup (e.g. database dump, Nextcloud
-  maintenance mode), ready-made hooks for Nextcloud included
+- **Nextcloud wrapper** `nextcloud-backup.sh`: maintenance mode, database
+  dump, backup, maintenance mode off – fully automatic
 - **mail** on failure, on warnings and when the target runs out of space
 
 The script runs **no shell commands** on the target – only SFTP – so
@@ -27,10 +27,12 @@ removes old snapshots of this host according to the retention policy.
 A run consists of:
 
 1. check the free space on the target (`MIN_FREE_PERCENT`),
-2. pre hooks (`pre.d/`),
-3. restic backup per source, then `forget --prune`,
-4. post hooks (`post.d/`) – always, also after errors,
-5. mail if something failed or there were warnings.
+2. restic backup per source, then `forget --prune`,
+3. mail if something failed or there were warnings.
+
+Anything that has to happen before or after – dumping a database, putting
+an application into maintenance mode – goes into a wrapper script that calls
+`backup.sh`, see "Nextcloud" and "Own steps before and after the backup".
 
 The repository password is read from `RESTIC_PASSWORD_FILE` (default
 `/etc/backup/restic.pass`). **Without this password all backups are lost** –
@@ -99,8 +101,6 @@ for the Storage Box (see below).
 | `EXCLUDES`    | Array of restic exclude patterns                  | empty   |
 | `RESTIC_FORGET_OPTS` | Array of `restic forget` policies, `()` = never delete | `--keep-daily 7 --keep-weekly 5 --keep-monthly 12` |
 | `LOG_FILE`    | Log file                                          | `/var/log/backup.log` |
-| `HOOKS_DIR`   | Folder with `pre.d/` and `post.d/`, see "Hooks"   | `hooks` next to the configuration |
-| `HOOK_TIMEOUT` | Time limit per hook in seconds, `0` = none       | `3600`  |
 | `MAIL_TO`     | Mail recipients (comma-separated), see "Mail"     | empty = no mails |
 | `MAIL_FROM`   | Sender address                                    | empty = mail system default |
 | `MIN_FREE_PERCENT` | Warn below this free space on the target, `0` = off | `5` |
@@ -202,56 +202,17 @@ lines and restic's error messages are still logged.
 Without a terminal (systemd, cron, output redirected) `-v` is ignored with a
 note, so the journal stays clean.
 
-## Hooks
+## Nextcloud
 
-Hooks run commands before and after the backup, e.g. dump databases or put
-an application into maintenance mode. They are executable files in two
-folders next to the configuration. The first run creates them if they are
-missing (as does `--init-config`):
+`nextcloud-backup.sh` wraps `backup.sh` for a server running Nextcloud:
 
-```
-/etc/backup/hooks/
-├── pre.d/      before the backup
-│   ├── 10-nextcloud
-│   └── 20-mysqldump
-└── post.d/     after the backup – always
-    └── 90-nextcloud
-```
-
-- Files run in lexical order, so prefix them with numbers. Their output
-  goes to the log.
-- **pre.d:** if a hook fails (exit code ≠ 0 or timeout), the remaining pre
-  hooks are skipped and the backup is aborted.
-- **post.d:** they run **always** once the pre phase has started – after a
-  successful backup, after an error, a failed pre hook and also when the
-  run is interrupted (`Ctrl+C`, `systemctl stop`). So everything a pre hook
-  switches on, a post hook can reliably switch off again. A failing post
-  hook makes the whole run exit with code 1.
-- Environment: `BACKUP_PHASE` (`pre`/`post`), `BACKUP_NAME`,
-  `BACKUP_CONFIG`, `BACKUP_LOG_FILE`; post hooks
-  additionally get `BACKUP_RESULT` (`success`/`failure`) and
-  `BACKUP_EXIT_CODE`.
-- Each hook may run at most `HOOK_TIMEOUT` seconds (default 3600).
-- When the script runs as root, a hook must be owned by root and must not
-  be writable by group or others; otherwise it is refused (and counts as
-  failed).
-- Non-executable files are skipped with a note, so `chmod -x` disables a
-  hook. Hidden files and `*~`, `*.bak`, `*.disabled`, `*.dpkg-*` are
-  ignored.
-- A dry run (`-n`) only lists the hooks, it does not run them.
-- Hooks get no input (`stdin` is `/dev/null`).
-- Signals: a hook that is currently running is finished first, then the
-  post hooks run. Under systemd the running hook receives the `SIGTERM`
-  itself.
-
-### Included hook: Nextcloud
-
-The repository contains a ready-made pair of hooks for Nextcloud:
-
-| Hook | Does |
-|---|---|
-| `hooks/pre.d/10-nextcloud` | maintenance mode on, database dump |
-| `hooks/post.d/90-nextcloud` | maintenance mode off – also after a failed backup |
+1. detects the installation, its user, the PHP version in use and the
+   database,
+2. enables maintenance mode and dumps the database,
+3. runs `backup.sh` (from the same directory) with all given options,
+4. **always** ends maintenance mode afterwards – also after a failed backup,
+   `Ctrl+C` or `systemctl stop`, and also if it was already on before.
+   Do not let a backup run during an upgrade.
 
 It detects automatically:
 
@@ -267,35 +228,30 @@ It detects automatically:
 
 The dump goes to `/var/backups/nextcloud/nextcloud-db.sql.gz` (SQLite:
 `nextcloud-db.sqlite`). It is first written to a `.tmp` file, so a failed
-dump never replaces the last good one, and it aborts the backup.
-
-The post hook **always** ends the maintenance mode, also if it was already
-on before the backup. Do not let a backup run during an upgrade. The pre
-hook passes the detected installation, user and PHP binary to the post hook
-in `/var/lib/backup/nextcloud.state`.
-
-The pre hook warns in the log if the Nextcloud `config` folder, the data
-directory or the dump folder is missing from `SOURCES`.
+dump never replaces the last good one; a failed dump aborts the run before
+the backup.
 
 ```bash
-# Install (from the repository clone)
-sudo install -m 755 -o root -g root hooks/pre.d/10-nextcloud  /etc/backup/hooks/pre.d/
-sudo install -m 755 -o root -g root hooks/post.d/90-nextcloud /etc/backup/hooks/post.d/
+# Check what is detected – changes nothing
+sudo /opt/backup/nextcloud-backup.sh --check
 
-# Check what was detected – changes nothing
-sudo BACKUP_CONFIG=/etc/backup/backup.conf /etc/backup/hooks/pre.d/10-nextcloud --check
+# Dry run: no maintenance mode, no dump, "backup.sh -n"
+sudo /opt/backup/nextcloud-backup.sh -n
+
+# Real run (all options are passed on to backup.sh, e.g. -v or -c FILE)
+sudo /opt/backup/nextcloud-backup.sh
 ```
 
 Example output of `--check`:
 
 ```
 Nextcloud: /var/www/nextcloud (version 30.0.2.1, user www-data, PHP 8.3.6, database mysql)
-Nextcloud: WARNING: /var/backups/nextcloud is not in SOURCES of /etc/backup/backup.conf – it will not be backed up.
+Nextcloud: Warning: /var/backups/nextcloud is not in SOURCES of /etc/backup/backup.conf – it will not be backed up.
 Nextcloud: maintenance mode is currently false; data directory /srv/nextcloud-data.
-Nextcloud: check only – a real run would enable maintenance mode and dump the database to /var/backups/nextcloud.
+Nextcloud: check only – a real run would enable maintenance mode, dump the database to /var/backups/nextcloud and run /opt/backup/backup.sh.
 ```
 
-`SOURCES` then needs at least:
+`SOURCES` in the backup configuration then needs at least:
 
 ```bash
 SOURCES=(
@@ -305,8 +261,18 @@ SOURCES=(
 )
 ```
 
+**Mails:** `backup.sh` reports its own failures. The wrapper reports, to
+the same `MAIL_TO`, what happens around it:
+
+- `[backup] FAILED before the backup` – e.g. Nextcloud not found or the
+  dump failed; no backup was made,
+- `[backup] FAILED – Nextcloud still in maintenance mode` – ending the
+  maintenance mode failed,
+- `[backup] WARNING` – e.g. a Nextcloud folder is missing from `SOURCES`.
+
 If the detection picks the wrong thing, override it in
-`/etc/backup/nextcloud.conf` (owned by root, sourced as Bash):
+`/etc/backup/nextcloud.conf` (next to the backup configuration, owned by
+root, sourced as Bash):
 
 ```bash
 NEXTCLOUD_DIR="/var/www/nextcloud"
@@ -315,39 +281,43 @@ NEXTCLOUD_DUMP=1                            # 0 = maintenance mode only
 NEXTCLOUD_DUMP_DIR="/var/backups/nextcloud"
 ```
 
+For the daily run, put the wrapper into the systemd service instead of
+`backup.sh`: `ExecStart=/opt/backup/nextcloud-backup.sh`.
+
 Not supported: snap and Docker installations.
 
-The installed hooks are copies: after a `git pull`, install them again to
-get updates.
+## Own steps before and after the backup
 
-### Writing your own hooks
+`backup.sh` itself only backs up. Wrap it in a small script for anything
+else; a `trap` makes sure the "after" part always runs:
 
-A hook is any executable file. For example, dumping all MySQL/MariaDB
-databases:
-
-`pre.d/20-mysqldump` – the dump folder must be in `SOURCES`
 ```bash
 #!/bin/bash
-set -eo pipefail
+set -euo pipefail
 umask 077
+
+trap 'systemctl start myapp' EXIT     # always, also on errors and Ctrl+C
+systemctl stop myapp
+
 mkdir -p /var/backups/mysql
-# Credentials from /root/.my.cnf (or socket authentication as root)
 mysqldump --all-databases --single-transaction --routines --events \
     | gzip > /var/backups/mysql/all-databases.sql.gz.tmp
 mv /var/backups/mysql/all-databases.sql.gz.tmp /var/backups/mysql/all-databases.sql.gz
+
+/opt/backup/backup.sh "$@"
 ```
 
-`pipefail` makes a failing `mysqldump` fail the hook despite the pipe; the
-`.tmp` file and `mv` make sure a broken dump never replaces the last good
-one. Install your own hooks with owner root and mode 755 as well.
+Keep in mind that `backup.sh` only mails its own failures: if the wrapper
+fails before calling it (e.g. the dump), no mail is sent. Let systemd
+report that (`OnFailure=` in the service) or send a mail from the wrapper,
+as `nextcloud-backup.sh` does.
 
 ## Mail notification
 
 With `MAIL_TO` set, the script sends a mail
 
 - **`[backup] FAILED: <name> (<date>)`** when the run ends with an error:
-  failed source, unreachable target, configuration error, failed hook,
-  interrupted run;
+  failed source, unreachable target, configuration error, interrupted run;
 - **`[backup] WARNING: <name> (<date>)`** when the backup succeeded but
   there were warnings: less than `MIN_FREE_PERCENT` free space on the
   target, unreadable files (restic code 3), old snapshots not removed.
@@ -375,7 +345,7 @@ If sending fails, this is logged; the exit code of the backup stays the same.
 
 ### Free space on the target
 
-Before the backup (and before the pre hooks) the script asks the target
+Before the backup the script asks the target
 for its free space with `df` in sftp – no shell needed; the Storage Box
 reports its quota there. The log shows e.g.
 `Space on the target: 476.8 of 1024.0 GiB free (46.6%).` Below
@@ -419,6 +389,8 @@ sudo systemctl enable --now backup.timer
 systemctl list-timers backup.timer
 journalctl -u backup.service
 ```
+
+With Nextcloud, use `ExecStart=/opt/backup/nextcloud-backup.sh` instead.
 
 `Persistent=true` catches up on a missed run, e.g. if the machine was off at
 night. Alternatively via cron: `30 2 * * * /opt/backup/backup.sh`.
@@ -474,5 +446,5 @@ cd /mnt/restore && zcat /tmp/.backup-perms.facl.gz | sudo setfacl --restore=-
 - Keep a copy of the repository password outside the server, and check the
   repository now and then: `sudo backup.sh --restic check` (add
   `--read-data-subset 5%` to also read part of the data).
-- Dump databases beforehand and back up the dump, not the live files – a
-  pre hook does that automatically, see "Hooks".
+- Dump databases beforehand and back up the dump, not the live files – in a
+  wrapper script, see "Own steps before and after the backup".
