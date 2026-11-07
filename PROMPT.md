@@ -62,7 +62,7 @@ Requirements:
 - Pre and post hooks: run the executable files in `<HOOKS_DIR>/pre.d/`
   before and in `<HOOKS_DIR>/post.d/` after the backup, in lexical order,
   output to the log (`HOOKS_DIR` default: `hooks` next to the configuration
-  file; `--init-config` creates both folders). A failing pre hook aborts
+  file; `--init-config` and every backup run create missing folders). A failing pre hook aborts
   the backup; post hooks always run once the pre phase has started, also on
   errors and signals (EXIT trap), with `BACKUP_RESULT` and
   `BACKUP_EXIT_CODE` in the environment, and a failing post hook makes the

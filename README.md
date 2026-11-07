@@ -234,7 +234,8 @@ note, so the journal stays clean.
 
 Hooks run commands before and after the backup, e.g. dump databases or put
 an application into maintenance mode. They are executable files in two
-folders next to the configuration (`--init-config` creates them):
+folders next to the configuration. The first run creates them if they are
+missing (as does `--init-config`):
 
 ```
 /etc/backup/hooks/

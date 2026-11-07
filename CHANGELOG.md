@@ -3,6 +3,13 @@
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 versioning according to [SemVer](https://semver.org/).
 
+## [3.4.1] – 2026-11-07
+
+### Changed
+- A backup run creates the missing hook folders `<HOOKS_DIR>/pre.d/` and
+  `post.d/` itself (not in a dry run), so existing installations need no
+  manual `mkdir`; if that is not possible, it continues without hooks
+
 ## [3.4.0] – 2026-11-07
 
 ### Added

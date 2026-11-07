@@ -17,7 +17,7 @@
 #
 set -euo pipefail
 
-readonly VERSION="3.4.0"
+readonly VERSION="3.4.1"
 # Kept outside the script directory, so the repository can be updated or
 # re-cloned at any time without touching the configuration.
 readonly DEFAULT_CONFIG="/etc/backup/backup.conf"
@@ -618,6 +618,22 @@ run_hooks() {
     return "$failed"
 }
 
+# Creates <HOOKS_DIR>/pre.d and post.d if missing (not in a dry run). Failing
+# to create them is no error – without folders there are simply no hooks.
+ensure_hook_dirs() {
+    local d missing=()
+    (( DRY_RUN )) && return 0
+    for d in "${HOOKS_DIR%/}/pre.d" "${HOOKS_DIR%/}/post.d"; do
+        [[ -d $d ]] || missing+=("$d")
+    done
+    (( ${#missing[@]} > 0 )) || return 0
+    if mkdir -p -m 755 -- "${missing[@]}" 2>/dev/null; then
+        log "Created hook folders: ${missing[*]}"
+    else
+        log "Note: could not create hook folders under $HOOKS_DIR – running without hooks."
+    fi
+}
+
 # EXIT trap: runs the post hooks (if the pre phase was reached) and cleans up.
 # A failing post hook turns a successful run into exit code 1.
 on_exit() {
@@ -667,6 +683,7 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 POST_HOOKS_PENDING=1
+ensure_hook_dirs
 run_hooks pre || die "A pre-backup hook failed – backup aborted (post-backup hooks still run)."
 
 case $BACKUP_METHOD in
